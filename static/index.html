@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    body {
+      margin: 0;
+      font-family: 'Lexend', sans-serif;
+      overflow: hidden;
+    }
+
+    .song-container {
+      position: fixed;
+      display: flex;
+      align-items: center;
+      gap: 15px;
+      opacity: 0;
+      transition: all var(--speed, 0.6s) cubic-bezier(0.4, 0, 0.2, 1);
+      font-size: var(--size, 36px);
+      color: var(--color, white);
+      background: var(--bg, rgba(0, 0, 0, 0.5));
+      border-radius: 0.3em;
+      padding: 1em;
+    }
+
+    /* Corner Positions - Initial */
+    .song-container[data-origin="tl"] {
+      transform-origin: top left;
+      top: -150px;
+      left: 20px;
+    }
+
+    .song-container[data-origin="tr"] {
+      transform-origin: top right;
+      top: -150px;
+      right: 20px;
+    }
+
+    .song-container[data-origin="bl"] {
+      transform-origin: bottom left;
+      bottom: -150px;
+      left: 20px;
+    }
+
+    .song-container[data-origin="br"] {
+      transform-origin: bottom right;
+      bottom: -150px;
+      right: 20px;
+    }
+
+    /* Center Positions - Initial */
+    .song-container[data-origin="cc"] {
+      transform-origin: center;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(0);
+      /* Ensure it stays centered by combining the translate and scale */
+      transition: transform var(--speed, 0.6s) cubic-bezier(0.4, 0, 0.2, 1),
+                  opacity var(--speed, 0.6s) cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .song-container[data-origin="tc"] {
+      transform-origin: top center;
+      top: -150px;
+      left: 50%;
+      transform: translateX(-50%);
+    }
+
+    .song-container[data-origin="bc"] {
+      transform-origin: bottom center;
+      bottom: -150px;
+      left: 50%;
+      transform: translateX(-50%);
+    }
+
+    .song-container[data-origin="cl"] {
+      transform-origin: center left;
+      top: 50%;
+      left: -150px;
+      transform: translateY(-50%);
+    }
+
+    .song-container[data-origin="cr"] {
+      transform-origin: center right;
+      top: 50%;
+      right: -150px;
+      transform: translateY(-50%);
+    }
+
+    /* Active States */
+    .song-container.active {
+      opacity: 1;
+    }
+
+    /* Corner Positions - Active */
+    .song-container[data-origin="tl"].active {
+      top: 0.6em;
+      left: 0.6em;
+    }
+
+    .song-container[data-origin="tr"].active {
+      top: 0.6em;
+      right: 0.6em;
+    }
+
+    .song-container[data-origin="bl"].active {
+      bottom: 0.6em;
+      left: 0.6em;
+    }
+
+    .song-container[data-origin="br"].active {
+      bottom: 0.6em;
+      right: 0.6em;
+    }
+
+    /* Center Positions - Active */
+    .song-container[data-origin="cc"].active {
+      transform: translate(-50%, -50%) scale(1);
+    }
+
+    .song-container[data-origin="tc"].active {
+      top: 0.6em;
+      transform: translateX(-50%) scale(1);
+    }
+
+    .song-container[data-origin="bc"].active {
+      bottom: 0.6em;
+      transform: translateX(-50%) scale(1);
+    }
+
+    .song-container[data-origin="cl"].active {
+      left: 0.6em;
+      transform: translateY(-50%) scale(1);
+    }
+
+    .song-container[data-origin="cr"].active {
+      right: 0.6em;
+      transform: translateY(-50%) scale(1);
+    }
+
+    /* Mini States */
+    .song-container.mini {
+      transform: scale(var(--mini-scale, 0.6));
+    }
+
+    /* Special case for cc to maintain centering during mini state */
+    .song-container[data-origin="cc"].mini {
+      transform: translate(-50%, -50%) scale(var(--mini-scale, 0.6));
+    }
+
+    /* Corner Positions - Mini */
+    .song-container[data-origin="tl"].active.mini {
+      top: calc(0.6em * var(--mini-scale, 0.6));
+      left: calc(0.6em * var(--mini-scale, 0.6));
+    }
+
+    .song-container[data-origin="tr"].active.mini {
+      top: calc(0.6em * var(--mini-scale, 0.6));
+      right: calc(0.6em * var(--mini-scale, 0.6));
+    }
+
+    .song-container[data-origin="bl"].active.mini {
+      bottom: calc(0.6em * var(--mini-scale, 0.6));
+      left: calc(0.6em * var(--mini-scale, 0.6));
+    }
+
+    .song-container[data-origin="br"].active.mini {
+      bottom: calc(0.6em * var(--mini-scale, 0.6));
+      right: calc(0.6em * var(--mini-scale, 0.6));
+    }
+
+    /* Center Positions - Mini */
+    .song-container[data-origin="cc"].mini {
+      transform: translate(-50%, -50%) scale(var(--mini-scale, 0.6));
+    }
+
+    .song-container[data-origin="tc"].mini {
+      top: calc(0.6em * var(--mini-scale, 0.6));
+      transform: translateX(-50%) scale(var(--mini-scale, 0.6));
+    }
+
+    .song-container[data-origin="bc"].mini {
+      bottom: calc(0.6em * var(--mini-scale, 0.6));
+      transform: translateX(-50%) scale(var(--mini-scale, 0.6));
+    }
+
+    .song-container[data-origin="cl"].mini {
+      left: calc(0.6em * var(--mini-scale, 0.6));
+      transform: translateY(-50%) scale(var(--mini-scale, 0.6));
+    }
+
+    .song-container[data-origin="cr"].mini {
+      right: calc(0.6em * var(--mini-scale, 0.6));
+      transform: translateY(-50%) scale(var(--mini-scale, 0.6));
+    }
+
+    .album-art {
+      width: 2.5em;
+      height: 2.5em;
+      border-radius: 0.3em;
+      background-size: cover;
+      background-position: center;
+    }
+
+    .song-info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .song-name {
+      font-weight: 500;
+    }
+
+    .artist-name {
+      font-size: 0.8em;
+      opacity: 0.8;
+    }
+  </style>
+</head>
+<body>
+  <div id="songDisplay" class="song-container" data-origin="bl">
+    <div class="album-art"></div>
+    <div class="song-info">
+      <div class="song-name"></div>
+      <div class="artist-name"></div>
+    </div>
+  </div>
+
+  <script>
+    const songDisplay = document.getElementById('songDisplay');
+    let dwellTime = 3000;
+    let failedConnectionTimeout;
+    let currentTimeout;
+    let ws;
+
+    function connectWebSocket() {
+      ws = new WebSocket('ws://localhost:52846/ws');
+
+      ws.onopen = function() {
+        console.log('Connected to server');
+        clearTimeout(failedConnectionTimeout);
+      };
+
+      ws.onmessage = function(event) {
+        const update = JSON.parse(event.data);
+
+        if (update.type === 'change') {
+          songChange(update.artist, update.song, update.albumArt);
+        } else if (update.type === 'stop') {
+          songStop();
+        }
+      };
+
+      ws.onclose = function() {
+        console.log('Disconnected from server');
+
+        // Attempt to reconnect after 5 seconds
+        setTimeout(connectWebSocket, 5000);
+
+        // If connection fails after 9 seconds, hide the song
+        clearTimeout(failedConnectionTimeout);
+        failedConnectionTimeout = setTimeout(songStop, 9000);
+      };
+
+      ws.onerror = function(error) {
+        console.error('WebSocket error:', error);
+      };
+    }
+
+    let lastUpdate = { artist: '', song: '', albumArt: '' };
+
+    function checkUpdateDisplay(artistName, songName, albumArt) {
+      if (lastUpdate.artist != artistName || lastUpdate.song != songName || lastUpdate.albumArt != albumArt) {
+        lastUpdate = { artist: artistName, song: songName, albumArt: albumArt };
+        return true;
+      }
+
+      // If display is already active, don't update
+      console.log(songDisplay.classList.contains('active'), songDisplay.classList.contains('mini'));
+      if (songDisplay.classList.contains('active') && !songDisplay.classList.contains('mini')) return true;
+      return false;
+    }
+
+    function updateDisplay(artistName, songName, albumArt) {
+      songDisplay.querySelector('.album-art').style.backgroundImage = 'url("'+albumArt+'")';
+      songDisplay.querySelector('.song-name').textContent = songName;
+      songDisplay.querySelector('.artist-name').textContent = artistName;
+    }
+
+    async function songChange(artistName, songName, albumArt) {
+      clearTimeout(currentTimeout);
+
+      // Check if unchanged
+      if (!checkUpdateDisplay(artistName, songName, albumArt)) return; // nothing to do if unchanged
+
+      // If display is already active, animate it away first
+      if (songDisplay.classList.contains('active')) {
+        songDisplay.classList.remove('active');
+        await new Promise(resolve => setTimeout(resolve, dwellTime*0.5));
+      }
+
+      // Update content and show the main display
+      updateDisplay(artistName, songName, albumArt);
+      songDisplay.classList.remove('mini');
+      songDisplay.classList.add('active');
+
+      // After delay, transform to mini version
+      currentTimeout = setTimeout(() => {
+        songDisplay.classList.add('mini');
+      }, dwellTime);
+    }
+
+    async function songStop() {
+      console.log('Song stopped');
+      clearTimeout(currentTimeout);
+      songDisplay.classList.remove('active');
+      lastUpdate = { artist: '', song: '', albumArt: '' }; // Reset last update
+    }
+
+    function overrideStyles() {
+      const urlParams = new URLSearchParams(window.location.search);
+
+      const get = (key, defaultValue, validOpts, map) => {
+        const value = urlParams.get(key);
+        const result = value ? value.trim().toLowerCase() : defaultValue;
+        if (typeof map === 'function') return map(result, validOpts);
+        if (validOpts && Array.isArray(validOpts) && !validOpts.includes(result)) return defaultValue;
+        return result;
+      };
+
+      songDisplay.dataset.origin = get('origin', 'bl', ['tl', 'tr', 'bl', 'br', 'cc', 'tc', 'bc', 'cl', 'cr'], (value, valid) => {
+        const clean = (v) => v.trim().toLowerCase().split('').sort().join('');
+        value = clean(value);
+        for (const v of valid) {
+          if (clean(v) === value) return v;
+        }
+        return; // Invalid value
+      });
+      document.documentElement.style.setProperty('--size', get('size', 36) + "px");
+      document.documentElement.style.setProperty('--color', get('color', 'white'));
+      document.documentElement.style.setProperty('--bg', get('bg', 'rgba(0,0,0,0.5)'));
+      document.documentElement.style.setProperty('--speed', get('speed', 0.6) + "s");
+      document.documentElement.style.setProperty('--mini-scale', get('mini', 0.6));
+      dwellTime = parseInt(get('dwell', 3)) * 1000;
+    }
+
+    // Connect to WebSocket when page loads
+    connectWebSocket();
+
+    // Override styles via query string
+    overrideStyles();
+  </script>
+</body>
+</html>
