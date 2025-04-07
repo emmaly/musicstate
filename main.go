@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -8,10 +9,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/emmaly/musicstate/nightbot"
@@ -53,21 +56,35 @@ type Server struct {
 	song        *Song
 	connections []*ConnectionState
 	mu          sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
+
+// Constants for timeouts and intervals
+const (
+	DefaultTimeout = 10 * time.Second
+)
 
 //go:embed static/*
 var staticFiles embed.FS
 
 func main() {
+	// Create a root context with cancellation for application-wide shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	
+	// Create a mux for routing
+	mux := http.NewServeMux()
+	
 	fileServer := http.FileServer(http.FS(staticFiles))
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// Rewrite the path to include "static"
 		r.URL.Path = "/static" + r.URL.Path
 		fileServer.ServeHTTP(w, r)
 	})
 
 	// Handle WebSocket connections
-	http.HandleFunc("/ws", wsHandler())
+	mux.HandleFunc("/ws", wsHandler())
 
 	// Try alternative port if default is unavailable
 	port := os.Getenv("MUSICSTATE_PORT")
@@ -76,19 +93,69 @@ func main() {
 	}
 	hostAddr := "localhost:" + port
 	fmt.Printf("SorceressEmmaly's MusicState\nCopyright (C) 2025 emmaly\nSee https://github.com/emmaly/musicstate for documentation, source code, and to file issues.\nThis program is licensed GPLv3; it comes with ABSOLUTELY NO WARRANTY.\nThis is free software, and you are welcome to redistribute it under certain conditions.\nReview license details at https://github.com/emmaly/musicstate/LICENSE\n\n\nUse http://%s as your browser source overlay URL.\n\n\n", hostAddr)
-	err := http.ListenAndServe(hostAddr, nil)
-	if err != nil {
+	
+	// Create a server with our mux
+	server := &http.Server{
+		Addr:    hostAddr,
+		Handler: mux,
+	}
+	
+	// Create a channel for shutdown completion notification
+	serverStopCtx, serverStopCtxCancel := context.WithCancel(context.Background())
+	
+	// Handle graceful server shutdown
+	go func() {
+		<-ctx.Done()
+		log.Println("Main context cancelled, shutting down HTTP server...")
+		
+		// Create a timeout for server shutdown
+		shutdownCtx, shutdownCtxCancel := context.WithTimeout(serverStopCtx, 10*time.Second)
+		defer shutdownCtxCancel()
+		
+		// Shutdown the server
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP server shutdown error: %v", err)
+		}
+		
+		serverStopCtxCancel()
+	}()
+	
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	
+	// Start a goroutine to handle shutdown signals
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal: %v", sig)
+		cancel() // Cancel the root context
+	}()
+	
+	// Start the server
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal("error starting service: ", err)
 	}
+	
+	// Wait for server to complete shutdown
+	<-serverStopCtx.Done()
+	log.Println("Server shutdown complete")
 }
 
 func wsHandler() http.HandlerFunc {
-	server := Server{}
+	// Create a context with cancellation for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	server := Server{
+		ctx:    ctx,
+		cancel: cancel,
+	}
 
-	// Start watching for music changes
+	// Set up clean shutdown on application exit
+	setupCleanShutdown(&server)
+
+	// Start watching for music changes with context
 	go server.watchMusic()
 	
-	// Start a connection health checker
+	// Start a connection health checker with context
 	go server.connectionHealthCheck()
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -156,7 +223,43 @@ func wsHandler() http.HandlerFunc {
 		}
 
 		// Keep connection alive and handle any incoming messages
+		// Create a goroutine to handle context cancellation
+		connCtx, connCancel := context.WithCancel(server.ctx)
+		defer connCancel()
+		
+		// Monitor for server context cancellation
+		go func() {
+			select {
+			case <-server.ctx.Done():
+				// Server is shutting down, close this connection
+				log.Println("Server shutting down, closing WebSocket connection")
+				connState.IsActive = false
+				connState.CloseOnce.Do(func() {
+					if connState.Conn != nil {
+						conn.Close()
+					}
+				})
+				connCancel()
+			case <-connCtx.Done():
+				// Connection is closing, nothing to do here
+				return
+			}
+		}()
+		
+		// Message reading loop
 		for {
+			select {
+			case <-connCtx.Done():
+				// Context cancelled, exit the loop
+				return
+			default:
+				// Continue with normal processing
+			}
+			
+			// Set read deadline
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			
+			// Read message with timeout
 			_, _, err := conn.ReadMessage()
 			if err != nil {
 				if websocket.IsUnexpectedCloseError(err, 
@@ -164,11 +267,9 @@ func wsHandler() http.HandlerFunc {
 					websocket.CloseNormalClosure) {
 					log.Printf("Read error: %v", err)
 				}
+				connCancel()
 				break
 			}
-			
-			// Reset deadlines on successful read
-			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 			
 			// Update last activity timestamp
 			server.mu.Lock()
@@ -193,6 +294,15 @@ func (s *Song) AsSongUpdate() SongUpdate {
 }
 
 func (server *Server) reportMusic(song *Song) {
+	// First check if context is already cancelled
+	select {
+	case <-server.ctx.Done():
+		// Context cancelled, don't report music
+		return
+	default:
+		// Context still valid, continue
+	}
+	
 	server.mu.Lock()
 
 	// Check if there's any change that requires updating clients
@@ -233,22 +343,39 @@ func (server *Server) reportMusic(song *Song) {
 	// Track dead connections to clean up after sending messages
 	var deadConnections []*ConnectionState
 	
+	// Check context again before sending updates
+	select {
+	case <-server.ctx.Done():
+		return
+	default:
+		// Context still valid, continue
+	}
+	
 	// Send to all connected clients
 	for _, connState := range connections {
-		// Skip already known inactive connections
-		if !connState.IsActive {
+		// Skip nil or already known inactive connections
+		if connState == nil || !connState.IsActive || connState.Conn == nil {
 			continue
 		}
 		
 		// Set a write deadline
 		connState.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		
+		// Attempt to send update
 		err := connState.Conn.WriteJSON(update)
 		if err != nil {
 			log.Printf("Write error to client: %v", err)
 			connState.IsActive = false
 			deadConnections = append(deadConnections, connState)
 		}
+	}
+	
+	// Check context again before cleanup
+	select {
+	case <-server.ctx.Done():
+		return
+	default:
+		// Context still valid, continue
 	}
 	
 	// Clean up any connections that failed during this update
@@ -276,53 +403,86 @@ func (server *Server) connectionHealthCheck() {
 	
 	log.Println("Starting WebSocket connection health checker")
 	
+	// Create a ticker for regular health checks
+	ticker := time.NewTicker(healthCheckInterval)
+	defer ticker.Stop()
+	
 	for {
-		time.Sleep(healthCheckInterval)
-		
-		server.mu.Lock()
-		if server.connections == nil || len(server.connections) == 0 {
-			server.mu.Unlock()
-			continue
-		}
-		
-		now := time.Now()
-		deadConnections := []*ConnectionState{}
-		
-		// Identify dead connections
-		for _, connState := range server.connections {
-			// If it's been too long since the last ping/activity
-			if now.Sub(connState.LastPing) > connectionTimeout {
-				log.Printf("Connection inactive for %v, marking as dead", now.Sub(connState.LastPing))
-				connState.IsActive = false
-				deadConnections = append(deadConnections, connState)
-			} else {
-				// Ping the connection to keep it alive and verify it's still working
-				deadline := time.Now().Add(5 * time.Second)
-				err := connState.Conn.WriteControl(websocket.PingMessage, []byte{}, deadline)
-				if err != nil {
-					log.Printf("Failed to ping connection: %v", err)
+		select {
+		case <-server.ctx.Done():
+			// Context cancelled, exit the goroutine cleanly
+			log.Println("Connection health checker shutting down gracefully")
+			return
+			
+		case <-ticker.C:
+			// Perform a health check
+			server.mu.Lock()
+			if server.connections == nil || len(server.connections) == 0 {
+				server.mu.Unlock()
+				continue
+			}
+			
+			now := time.Now()
+			deadConnections := []*ConnectionState{}
+			
+			// Identify dead connections
+			for _, connState := range server.connections {
+				// Skip nil connections
+				if connState == nil || connState.Conn == nil {
+					continue
+				}
+				
+				// If it's been too long since the last ping/activity
+				if now.Sub(connState.LastPing) > connectionTimeout {
+					log.Printf("Connection inactive for %v, marking as dead", now.Sub(connState.LastPing))
 					connState.IsActive = false
 					deadConnections = append(deadConnections, connState)
+				} else {
+					// Check context before sending pings
+					select {
+					case <-server.ctx.Done():
+						server.mu.Unlock()
+						return
+					default:
+						// Context still valid, continue with ping
+					}
+					
+					// Ping the connection to keep it alive and verify it's still working
+					deadline := time.Now().Add(5 * time.Second)
+					err := connState.Conn.WriteControl(websocket.PingMessage, []byte{}, deadline)
+					if err != nil {
+						log.Printf("Failed to ping connection: %v", err)
+						connState.IsActive = false
+						deadConnections = append(deadConnections, connState)
+					}
 				}
 			}
-		}
-		
-		server.mu.Unlock()
-		
-		// Clean up dead connections
-		if len(deadConnections) > 0 {
-			log.Printf("Found %d dead connections to clean up", len(deadConnections))
-			for _, connState := range deadConnections {
-				if connState != nil {
-					log.Println("Cleaning up dead connection")
-					server.removeConnection(connState)
-					
-					// Safe close with nil check
-					connState.CloseOnce.Do(func() {
-						if connState.Conn != nil {
-							connState.Conn.Close()
-						}
-					})
+			
+			server.mu.Unlock()
+			
+			// Check context again before cleanup
+			select {
+			case <-server.ctx.Done():
+				return
+			default:
+				// Context still valid, continue with cleanup
+			}
+			
+			// Clean up dead connections
+			if len(deadConnections) > 0 {
+				log.Printf("Found %d dead connections to clean up", len(deadConnections))
+				for _, connState := range deadConnections {
+					if connState != nil {
+						log.Println("Cleaning up dead connection")
+						server.removeConnection(connState)
+						
+						// Safe close with nil check
+						connState.CloseOnce.Do(func() {
+							if connState.Conn != nil {
+								connState.Conn.Close()
+							}
+						})
+					}
 				}
 			}
 		}
@@ -399,6 +559,51 @@ func (server *Server) removeConnection(connState *ConnectionState) {
 	server.connections = newConnections
 }
 
+// setupCleanShutdown sets up signal handling for graceful shutdown
+func setupCleanShutdown(server *Server) {
+	// Create a channel to listen for OS signals
+	sigChan := make(chan os.Signal, 1)
+	
+	// Register for signal notifications
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	
+	// Start a goroutine to handle shutdown signals
+	go func() {
+		// Wait for termination signal
+		sig := <-sigChan
+		log.Printf("Received shutdown signal: %v", sig)
+		
+		// Initiate graceful shutdown
+		log.Println("Starting graceful shutdown...")
+		
+		// Cancel the context to notify all goroutines
+		if server.cancel != nil {
+			server.cancel()
+		}
+		
+		// Close all WebSocket connections
+		server.mu.Lock()
+		connections := server.connections
+		server.connections = nil
+		server.mu.Unlock()
+		
+		// Close all active connections
+		for _, connState := range connections {
+			if connState != nil {
+				connState.IsActive = false
+				connState.CloseOnce.Do(func() {
+					if connState.Conn != nil {
+						log.Println("Closing WebSocket connection during shutdown")
+						connState.Conn.Close()
+					}
+				})
+			}
+		}
+		
+		log.Println("Graceful shutdown completed")
+	}()
+}
+
 func (server *Server) watchMusic() {
 	const (
 		tidal              = "TIDAL.exe"
@@ -453,101 +658,139 @@ func (server *Server) watchMusic() {
 		}
 	}
 
-	for {
-		var song *Song
-		now := time.Now()
+	// Create a ticker for regular polling
+	windowTicker := time.NewTicker(windowPollInterval)
+	defer windowTicker.Stop()
 
-		// First try API-based players (like Nightbot) but only every 5 seconds
-		if nightbotPlayer != nil && now.Sub(lastNightbotPoll) >= nightbotPollInterval {
-			log.Printf("Polling Nightbot (last poll was %v ago)", now.Sub(lastNightbotPoll))
-			lastNightbotPoll = now
+	// Use the server's context for cancellation
+	for {
+		select {
+		case <-server.ctx.Done():
+			// Context cancelled, exit the goroutine cleanly
+			log.Println("Watch music goroutine shutting down gracefully")
+			return
 			
-			nowPlaying, err := nightbotPlayer.GetCurrentTrack()
-			if err == nil && nowPlaying != nil {
-				lastNightbotSong = &Song{
-					Artist: nowPlaying.Artist,
-					Song:   nowPlaying.Title,
-				}
-				log.Println("Updated Nightbot song from API")
-			} else {
-				// Clear the cached song when there's an error or no song playing
-				if lastNightbotSong != nil {
-					log.Println("Clearing previously cached Nightbot song")
-				}
-				lastNightbotSong = nil
+		case <-windowTicker.C:
+			// Regular polling tick
+			var song *Song
+			now := time.Now()
+
+			// First try API-based players (like Nightbot) but only every 5 seconds
+			if nightbotPlayer != nil && now.Sub(lastNightbotPoll) >= nightbotPollInterval {
+				log.Printf("Polling Nightbot (last poll was %v ago)", now.Sub(lastNightbotPoll))
+				lastNightbotPoll = now
 				
-				if err != nil {
-					if errors.Is(err, nightbot.ErrNoCurrentSong) {
-						log.Println("No current song playing in Nightbot")
-					} else {
-						log.Printf("Nightbot error: %v", err)
+
+				// Check if parent context is already cancelled
+				select {
+				case <-server.ctx.Done():
+					return
+				default:
+					// Context still valid, proceed with API call
+				}
+				
+				// Set a deadline for the API call
+				apiCallStart := time.Now()
+				
+				// Make the API call
+				nowPlaying, err := nightbotPlayer.GetCurrentTrack()
+				
+				// Log warning if the call took too long
+				if time.Since(apiCallStart) > DefaultTimeout {
+					log.Printf("Warning: Nightbot API call took %v, longer than expected timeout of %v", 
+						time.Since(apiCallStart), DefaultTimeout)
+				}
+				
+				if err == nil && nowPlaying != nil {
+					lastNightbotSong = &Song{
+						Artist: nowPlaying.Artist,
+						Song:   nowPlaying.Title,
 					}
+					log.Println("Updated Nightbot song from API")
 				} else {
-					log.Println("No current song data from Nightbot")
+					// Clear the cached song when there's an error or no song playing
+					if lastNightbotSong != nil {
+						log.Println("Clearing previously cached Nightbot song")
+					}
+					lastNightbotSong = nil
+					
+					if err != nil {
+						if errors.Is(err, nightbot.ErrNoCurrentSong) {
+							log.Println("No current song playing in Nightbot")
+						} else {
+							log.Printf("Nightbot error: %v", err)
+						}
+					} else {
+						log.Println("No current song data from Nightbot")
+					}
 				}
 			}
-		}
-		
-		// Use the cached Nightbot song if available
-		if lastNightbotSong != nil {
-			song = lastNightbotSong
-		}
-		
-		// Always check for window-based players to detect when songs stop
-		windows, err := winapi.FindWindowsByProcess(
-			[]string{tidal, spotify},
-			winapi.WinVisible(true),
-			winapi.WinClass("Chrome_WidgetWin_1"),
-			winapi.WinTitlePattern(*regexp.MustCompile("-")),
-		)
-		
-		var foundWindowSong bool
-		if err != nil {
-			log.Printf("Error finding windows: %v", err)
-		} else {
-			for _, w := range windows {
-				delimiter := " - "
-				songParts := strings.Split(w.Title, delimiter)
-				if len(songParts) >= 2 {
-					foundWindowSong = true
-					if song == nil { // Only use window song if we don't have a Nightbot song
-						if w.ProcessName == tidal {
-							song = &Song{
-								Artist: songParts[len(songParts)-1],
-								Song:   strings.Join(songParts[:len(songParts)-1], delimiter),
-							}
-						} else if w.ProcessName == spotify {
-							song = &Song{
-								Artist: songParts[0],
-								Song:   strings.Join(songParts[1:], delimiter),
+			
+			// Use the cached Nightbot song if available
+			if lastNightbotSong != nil {
+				song = lastNightbotSong
+			}
+			
+			// Always check for window-based players to detect when songs stop
+			// Check context before performing window search
+			select {
+			case <-server.ctx.Done():
+				return
+			default:
+				// Context still valid, continue with window search
+			}
+			
+			windows, err := winapi.FindWindowsByProcess(
+				[]string{tidal, spotify},
+				winapi.WinVisible(true),
+				winapi.WinClass("Chrome_WidgetWin_1"),
+				winapi.WinTitlePattern(*regexp.MustCompile("-")),
+			)
+			
+			var foundWindowSong bool
+			if err != nil {
+				log.Printf("Error finding windows: %v", err)
+			} else {
+				for _, w := range windows {
+					delimiter := " - "
+					songParts := strings.Split(w.Title, delimiter)
+					if len(songParts) >= 2 {
+						foundWindowSong = true
+						if song == nil { // Only use window song if we don't have a Nightbot song
+							if w.ProcessName == tidal {
+								song = &Song{
+									Artist: songParts[len(songParts)-1],
+									Song:   strings.Join(songParts[:len(songParts)-1], delimiter),
+								}
+							} else if w.ProcessName == spotify {
+								song = &Song{
+									Artist: songParts[0],
+									Song:   strings.Join(songParts[1:], delimiter),
+								}
 							}
 						}
 					}
+					if song != nil && foundWindowSong {
+						break
+					}
 				}
-				if song != nil && foundWindowSong {
-					break
+				
+				// If no window song found and last Nightbot poll was a while ago,
+				// clear the lastNightbotSong to ensure we don't keep stale state
+				if !foundWindowSong && lastNightbotSong != nil && now.Sub(lastNightbotPoll) >= (nightbotPollInterval*2) {
+					log.Println("No window song found and Nightbot poll is old - clearing song cache")
+					lastNightbotSong = nil
+					song = nil
 				}
 			}
-			
-			// If no window song found and last Nightbot poll was a while ago,
-			// clear the lastNightbotSong to ensure we don't keep stale state
-			if !foundWindowSong && lastNightbotSong != nil && now.Sub(lastNightbotPoll) >= (nightbotPollInterval*2) {
-				log.Println("No window song found and Nightbot poll is old - clearing song cache")
-				lastNightbotSong = nil
-				song = nil
+
+			if song != nil && song.Song != "" && song.AlbumArt == "" {
+				// set the placeholder album art
+				// Use a relative URL for the album art so it works with any host/port
+				song.AlbumArt = "/images/album.jpg"
 			}
+
+			server.reportMusic(song)
 		}
-
-		if song != nil && song.Song != "" && song.AlbumArt == "" {
-			// set the placeholder album art
-			// Use a relative URL for the album art so it works with any host/port
-			song.AlbumArt = "/images/album.jpg"
-		}
-
-		server.reportMusic(song)
-
-		// Always sleep for the window poll interval (1 second)
-		// Nightbot polling is controlled by the timestamp check above
-		time.Sleep(windowPollInterval)
 	}
 }
