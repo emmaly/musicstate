@@ -80,6 +80,9 @@ func NewClient(clientID, clientSecret, redirectURL string, token *oauth2.Token) 
 	}
 }
 
+// ErrNoCurrentSong is returned when there's no active song playing
+var ErrNoCurrentSong = errors.New("no current song playing")
+
 // GetCurrentSong returns the current playing song
 func (c *Client) GetCurrentSong() (*musicstate.NowPlaying, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
@@ -121,7 +124,7 @@ func (c *Client) GetCurrentSong() (*musicstate.NowPlaying, error) {
 
 	if queue.CurrentSong == nil {
 		log.Println("No current song playing in Nightbot")
-		return nil, errors.New("no current song playing")
+		return nil, ErrNoCurrentSong
 	}
 
 	// Include requester name in the log
@@ -223,7 +226,7 @@ func (p *NightbotPlayer) GetCurrentTrack() (*musicstate.NowPlaying, error) {
 	// Get current song from Nightbot API
 	track, err := p.client.GetCurrentSong()
 	if err != nil {
-		if errors.Is(err, errors.New("no current song playing")) {
+		if errors.Is(err, ErrNoCurrentSong) {
 			log.Println("No active songs in Nightbot queue")
 		} else {
 			log.Printf("Error fetching Nightbot song: %v", err)

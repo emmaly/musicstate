@@ -446,7 +446,7 @@ func (server *Server) watchMusic() {
 				lastNightbotSong = nil
 				
 				if err != nil {
-					if errors.Is(err, errors.New("no current song playing")) {
+					if errors.Is(err, nightbot.ErrNoCurrentSong) {
 						log.Println("No current song playing in Nightbot")
 					} else {
 						log.Printf("Nightbot error: %v", err)
