@@ -49,13 +49,13 @@ type ConnectionState struct {
 	Conn      *websocket.Conn
 	IsActive  bool
 	LastPing  time.Time
-	CloseOnce sync.Once  // Ensures we only close once
+	CloseOnce sync.Once // Ensures we only close once
 }
 
 type Server struct {
 	song        *Song
 	connections []*ConnectionState
-	mu          sync.Mutex
+	mu          sync.RWMutex // Use RWMutex for better concurrency
 	ctx         context.Context
 	cancel      context.CancelFunc
 }
@@ -72,10 +72,10 @@ func main() {
 	// Create a root context with cancellation for application-wide shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	
+
 	// Create a mux for routing
 	mux := http.NewServeMux()
-	
+
 	fileServer := http.FileServer(http.FS(staticFiles))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// Rewrite the path to include "static"
@@ -93,49 +93,49 @@ func main() {
 	}
 	hostAddr := "localhost:" + port
 	fmt.Printf("SorceressEmmaly's MusicState\nCopyright (C) 2025 emmaly\nSee https://github.com/emmaly/musicstate for documentation, source code, and to file issues.\nThis program is licensed GPLv3; it comes with ABSOLUTELY NO WARRANTY.\nThis is free software, and you are welcome to redistribute it under certain conditions.\nReview license details at https://github.com/emmaly/musicstate/LICENSE\n\n\nUse http://%s as your browser source overlay URL.\n\n\n", hostAddr)
-	
+
 	// Create a server with our mux
 	server := &http.Server{
 		Addr:    hostAddr,
 		Handler: mux,
 	}
-	
+
 	// Create a channel for shutdown completion notification
 	serverStopCtx, serverStopCtxCancel := context.WithCancel(context.Background())
-	
+
 	// Handle graceful server shutdown
 	go func() {
 		<-ctx.Done()
 		log.Println("Main context cancelled, shutting down HTTP server...")
-		
+
 		// Create a timeout for server shutdown
 		shutdownCtx, shutdownCtxCancel := context.WithTimeout(serverStopCtx, 10*time.Second)
 		defer shutdownCtxCancel()
-		
+
 		// Shutdown the server
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("HTTP server shutdown error: %v", err)
 		}
-		
+
 		serverStopCtxCancel()
 	}()
-	
+
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	
+
 	// Start a goroutine to handle shutdown signals
 	go func() {
 		sig := <-sigChan
 		log.Printf("Received signal: %v", sig)
 		cancel() // Cancel the root context
 	}()
-	
+
 	// Start the server
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal("error starting service: ", err)
 	}
-	
+
 	// Wait for server to complete shutdown
 	<-serverStopCtx.Done()
 	log.Println("Server shutdown complete")
@@ -154,7 +154,7 @@ func wsHandler() http.HandlerFunc {
 
 	// Start watching for music changes with context
 	go server.watchMusic()
-	
+
 	// Start a connection health checker with context
 	go server.connectionHealthCheck()
 
@@ -164,7 +164,7 @@ func wsHandler() http.HandlerFunc {
 			log.Println("Upgrade error:", err)
 			return
 		}
-		
+
 		// Set up ping handler to track connection health
 		conn.SetPingHandler(func(appData string) error {
 			// Update the connection's last ping time
@@ -177,7 +177,7 @@ func wsHandler() http.HandlerFunc {
 			}
 			return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
 		})
-		
+
 		// Set reasonable timeouts
 		conn.SetReadLimit(1024) // Limit incoming message sizes
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -194,10 +194,10 @@ func wsHandler() http.HandlerFunc {
 			LastPing: time.Now(),
 		}
 		server.addConnection(connState)
-		
+
 		// Ensure connection is properly cleaned up when this handler exits
 		defer func() {
-			server.removeConnection(connState) 
+			server.removeConnection(connState)
 			connState.CloseOnce.Do(func() {
 				conn.Close()
 				log.Println("WebSocket connection closed and cleaned up")
@@ -215,7 +215,7 @@ func wsHandler() http.HandlerFunc {
 			log.Println("Sending stop state to new connection (no song playing)")
 		}
 		server.mu.Unlock()
-		
+
 		err = conn.WriteJSON(update)
 		if err != nil {
 			log.Println("Initial write error:", err)
@@ -226,7 +226,7 @@ func wsHandler() http.HandlerFunc {
 		// Create a goroutine to handle context cancellation
 		connCtx, connCancel := context.WithCancel(server.ctx)
 		defer connCancel()
-		
+
 		// Monitor for server context cancellation
 		go func() {
 			select {
@@ -245,7 +245,7 @@ func wsHandler() http.HandlerFunc {
 				return
 			}
 		}()
-		
+
 		// Message reading loop
 		for {
 			select {
@@ -255,22 +255,22 @@ func wsHandler() http.HandlerFunc {
 			default:
 				// Continue with normal processing
 			}
-			
+
 			// Set read deadline
 			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-			
+
 			// Read message with timeout
 			_, _, err := conn.ReadMessage()
 			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, 
-					websocket.CloseGoingAway, 
+				if websocket.IsUnexpectedCloseError(err,
+					websocket.CloseGoingAway,
 					websocket.CloseNormalClosure) {
 					log.Printf("Read error: %v", err)
 				}
 				connCancel()
 				break
 			}
-			
+
 			// Update last activity timestamp
 			server.mu.Lock()
 			connState.LastPing = time.Now()
@@ -302,10 +302,27 @@ func (server *Server) reportMusic(song *Song) {
 	default:
 		// Context still valid, continue
 	}
-	
+
+	// First check if there's any change with a read lock
+	server.mu.RLock()
+	noChange := (server.song == nil && song == nil) ||
+		(server.song != nil &&
+			song != nil &&
+			server.song.Song == song.Song &&
+			server.song.Artist == song.Artist &&
+			server.song.AlbumArt == song.AlbumArt)
+	hasConnections := server.connections != nil && len(server.connections) > 0
+	server.mu.RUnlock()
+
+	// If no changes or no connections, return early without acquiring write lock
+	if noChange || !hasConnections {
+		return
+	}
+
+	// Upgrade to write lock to modify server state
 	server.mu.Lock()
 
-	// Check if there's any change that requires updating clients
+	// Double-check state with the write lock (state might have changed)
 	if (server.song == nil && song == nil) ||
 		(server.song != nil &&
 			song != nil &&
@@ -340,9 +357,6 @@ func (server *Server) reportMusic(song *Song) {
 	copy(connections, server.connections)
 	server.mu.Unlock()
 
-	// Track dead connections to clean up after sending messages
-	var deadConnections []*ConnectionState
-	
 	// Check context again before sending updates
 	select {
 	case <-server.ctx.Done():
@@ -350,26 +364,46 @@ func (server *Server) reportMusic(song *Song) {
 	default:
 		// Context still valid, continue
 	}
-	
-	// Send to all connected clients
+
+	// Track dead connections to clean up after sending messages
+	var deadConnections []*ConnectionState
+	var deadConnectionsMu sync.Mutex // Protect the deadConnections slice
+
+	// Use a WaitGroup to track when all sends are done
+	var wg sync.WaitGroup
+
+	// Send to all connected clients in parallel
 	for _, connState := range connections {
 		// Skip nil or already known inactive connections
 		if connState == nil || !connState.IsActive || connState.Conn == nil {
 			continue
 		}
-		
-		// Set a write deadline
-		connState.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		
-		// Attempt to send update
-		err := connState.Conn.WriteJSON(update)
-		if err != nil {
-			log.Printf("Write error to client: %v", err)
-			connState.IsActive = false
-			deadConnections = append(deadConnections, connState)
-		}
+
+		// Launch goroutine for each send operation
+		wg.Add(1)
+		go func(connState *ConnectionState) {
+			defer wg.Done()
+
+			// Set a write deadline
+			connState.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+
+			// Attempt to send update
+			err := connState.Conn.WriteJSON(update)
+			if err != nil {
+				log.Printf("Write error to client: %v", err)
+				connState.IsActive = false
+
+				// Safely add to dead connections
+				deadConnectionsMu.Lock()
+				deadConnections = append(deadConnections, connState)
+				deadConnectionsMu.Unlock()
+			}
+		}(connState)
 	}
-	
+
+	// Wait for all send operations to complete
+	wg.Wait()
+
 	// Check context again before cleanup
 	select {
 	case <-server.ctx.Done():
@@ -377,7 +411,7 @@ func (server *Server) reportMusic(song *Song) {
 	default:
 		// Context still valid, continue
 	}
-	
+
 	// Clean up any connections that failed during this update
 	if len(deadConnections) > 0 {
 		log.Printf("Cleaning up %d dead connections after update", len(deadConnections))
@@ -400,66 +434,97 @@ func (server *Server) connectionHealthCheck() {
 		healthCheckInterval = 30 * time.Second
 		connectionTimeout   = 120 * time.Second
 	)
-	
+
 	log.Println("Starting WebSocket connection health checker")
-	
+
 	// Create a ticker for regular health checks
 	ticker := time.NewTicker(healthCheckInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-server.ctx.Done():
 			// Context cancelled, exit the goroutine cleanly
 			log.Println("Connection health checker shutting down gracefully")
 			return
-			
+
 		case <-ticker.C:
-			// Perform a health check
+			// First check for connections with a read lock
+			server.mu.RLock()
+			hasConnections := server.connections != nil && len(server.connections) > 0
+			server.mu.RUnlock()
+
+			if !hasConnections {
+				continue
+			}
+
+			// Perform a health check with write lock to get copy of connections
 			server.mu.Lock()
+			// Double check connections exist with write lock
 			if server.connections == nil || len(server.connections) == 0 {
 				server.mu.Unlock()
 				continue
 			}
-			
+
+			// Copy connections to avoid holding the lock during potentially slow operations
+			connections := make([]*ConnectionState, len(server.connections))
+			copy(connections, server.connections)
+			server.mu.Unlock()
+
 			now := time.Now()
-			deadConnections := []*ConnectionState{}
-			
-			// Identify dead connections
-			for _, connState := range server.connections {
+			var deadConnections []*ConnectionState
+			var deadConnectionsMu sync.Mutex // Protect the deadConnections slice
+
+			// Use a WaitGroup to track ping operations
+			var wg sync.WaitGroup
+
+			// Process connections in parallel
+			for _, connState := range connections {
 				// Skip nil connections
 				if connState == nil || connState.Conn == nil {
 					continue
 				}
-				
-				// If it's been too long since the last ping/activity
-				if now.Sub(connState.LastPing) > connectionTimeout {
-					log.Printf("Connection inactive for %v, marking as dead", now.Sub(connState.LastPing))
-					connState.IsActive = false
-					deadConnections = append(deadConnections, connState)
-				} else {
+
+				wg.Add(1)
+				go func(connState *ConnectionState) {
+					defer wg.Done()
+
+					// Check if this connection is already timed out
+					if now.Sub(connState.LastPing) > connectionTimeout {
+						log.Printf("Connection inactive for %v, marking as dead", now.Sub(connState.LastPing))
+						connState.IsActive = false
+
+						deadConnectionsMu.Lock()
+						deadConnections = append(deadConnections, connState)
+						deadConnectionsMu.Unlock()
+						return
+					}
+
 					// Check context before sending pings
 					select {
 					case <-server.ctx.Done():
-						server.mu.Unlock()
 						return
 					default:
 						// Context still valid, continue with ping
 					}
-					
+
 					// Ping the connection to keep it alive and verify it's still working
 					deadline := time.Now().Add(5 * time.Second)
 					err := connState.Conn.WriteControl(websocket.PingMessage, []byte{}, deadline)
 					if err != nil {
 						log.Printf("Failed to ping connection: %v", err)
 						connState.IsActive = false
+
+						deadConnectionsMu.Lock()
 						deadConnections = append(deadConnections, connState)
+						deadConnectionsMu.Unlock()
 					}
-				}
+				}(connState)
 			}
-			
-			server.mu.Unlock()
-			
+
+			// Wait for all ping operations to complete
+			wg.Wait()
+
 			// Check context again before cleanup
 			select {
 			case <-server.ctx.Done():
@@ -467,7 +532,7 @@ func (server *Server) connectionHealthCheck() {
 			default:
 				// Context still valid, continue with cleanup
 			}
-			
+
 			// Clean up dead connections
 			if len(deadConnections) > 0 {
 				log.Printf("Found %d dead connections to clean up", len(deadConnections))
@@ -475,7 +540,7 @@ func (server *Server) connectionHealthCheck() {
 					if connState != nil {
 						log.Println("Cleaning up dead connection")
 						server.removeConnection(connState)
-						
+
 						// Safe close with nil check
 						connState.CloseOnce.Do(func() {
 							if connState.Conn != nil {
@@ -491,11 +556,11 @@ func (server *Server) connectionHealthCheck() {
 
 // findConnection looks up a connection by its conn pointer
 func (server *Server) findConnection(conn *websocket.Conn) *ConnectionState {
-	server.mu.Lock()
-	defer server.mu.Unlock()
-	
+	server.mu.RLock() // Use Read Lock for better concurrency
+	defer server.mu.RUnlock()
+
 	for _, connState := range server.connections {
-		if connState.Conn == conn {
+		if connState != nil && connState.Conn == conn {
 			return connState
 		}
 	}
@@ -522,7 +587,7 @@ func (server *Server) removeConnection(connState *ConnectionState) {
 	if server.connections == nil || len(server.connections) == 0 {
 		return
 	}
-	
+
 	// If we're removing the only connection, just set to empty slice
 	if len(server.connections) == 1 && server.connections[0] == connState {
 		log.Println("Removed last connection, connections now empty")
@@ -536,9 +601,9 @@ func (server *Server) removeConnection(connState *ConnectionState) {
 	if capacity > 0 {
 		capacity--
 	}
-	
+
 	newConnections := make([]*ConnectionState, 0, capacity)
-	
+
 	// Only append connections that don't match the one we're removing
 	var removed bool
 	for _, cs := range server.connections {
@@ -548,14 +613,14 @@ func (server *Server) removeConnection(connState *ConnectionState) {
 			removed = true
 		}
 	}
-	
+
 	// If we actually removed a connection, log it
 	if removed {
 		log.Printf("Removed connection, remaining connections: %d", len(newConnections))
 	} else {
 		log.Println("Connection not found in list, no connection removed")
 	}
-	
+
 	server.connections = newConnections
 }
 
@@ -563,30 +628,30 @@ func (server *Server) removeConnection(connState *ConnectionState) {
 func setupCleanShutdown(server *Server) {
 	// Create a channel to listen for OS signals
 	sigChan := make(chan os.Signal, 1)
-	
+
 	// Register for signal notifications
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	
+
 	// Start a goroutine to handle shutdown signals
 	go func() {
 		// Wait for termination signal
 		sig := <-sigChan
 		log.Printf("Received shutdown signal: %v", sig)
-		
+
 		// Initiate graceful shutdown
 		log.Println("Starting graceful shutdown...")
-		
+
 		// Cancel the context to notify all goroutines
 		if server.cancel != nil {
 			server.cancel()
 		}
-		
+
 		// Close all WebSocket connections
 		server.mu.Lock()
 		connections := server.connections
 		server.connections = nil
 		server.mu.Unlock()
-		
+
 		// Close all active connections
 		for _, connState := range connections {
 			if connState != nil {
@@ -599,19 +664,19 @@ func setupCleanShutdown(server *Server) {
 				})
 			}
 		}
-		
+
 		log.Println("Graceful shutdown completed")
 	}()
 }
 
 func (server *Server) watchMusic() {
 	const (
-		tidal              = "TIDAL.exe"
-		spotify            = "Spotify.exe"
+		tidal               = "TIDAL.exe"
+		spotify             = "Spotify.exe"
 		defaultNightbotPoll = 5 // seconds
-		windowPollInterval = 1 * time.Second
+		windowPollInterval  = 1 * time.Second
 	)
-	
+
 	// Allow configuring Nightbot poll interval with environment variable
 	nightbotPollSeconds, err := strconv.Atoi(os.Getenv("NIGHTBOT_POLL_INTERVAL"))
 	if err != nil || nightbotPollSeconds < 1 {
@@ -624,7 +689,7 @@ func (server *Server) watchMusic() {
 	var nightbotPlayer *nightbot.NightbotPlayer
 	var lastNightbotPoll time.Time
 	var lastNightbotSong *Song
-	
+
 	clientID := os.Getenv("NIGHTBOT_CLIENT_ID")
 	clientSecret := os.Getenv("NIGHTBOT_CLIENT_SECRET")
 	redirectURL := os.Getenv("NIGHTBOT_REDIRECT_URL")
@@ -669,7 +734,7 @@ func (server *Server) watchMusic() {
 			// Context cancelled, exit the goroutine cleanly
 			log.Println("Watch music goroutine shutting down gracefully")
 			return
-			
+
 		case <-windowTicker.C:
 			// Regular polling tick
 			var song *Song
@@ -679,7 +744,6 @@ func (server *Server) watchMusic() {
 			if nightbotPlayer != nil && now.Sub(lastNightbotPoll) >= nightbotPollInterval {
 				log.Printf("Polling Nightbot (last poll was %v ago)", now.Sub(lastNightbotPoll))
 				lastNightbotPoll = now
-				
 
 				// Check if parent context is already cancelled
 				select {
@@ -688,19 +752,19 @@ func (server *Server) watchMusic() {
 				default:
 					// Context still valid, proceed with API call
 				}
-				
+
 				// Set a deadline for the API call
 				apiCallStart := time.Now()
-				
+
 				// Make the API call
 				nowPlaying, err := nightbotPlayer.GetCurrentTrack()
-				
+
 				// Log warning if the call took too long
 				if time.Since(apiCallStart) > DefaultTimeout {
-					log.Printf("Warning: Nightbot API call took %v, longer than expected timeout of %v", 
+					log.Printf("Warning: Nightbot API call took %v, longer than expected timeout of %v",
 						time.Since(apiCallStart), DefaultTimeout)
 				}
-				
+
 				if err == nil && nowPlaying != nil {
 					lastNightbotSong = &Song{
 						Artist: nowPlaying.Artist,
@@ -713,7 +777,7 @@ func (server *Server) watchMusic() {
 						log.Println("Clearing previously cached Nightbot song")
 					}
 					lastNightbotSong = nil
-					
+
 					if err != nil {
 						if errors.Is(err, nightbot.ErrNoCurrentSong) {
 							log.Println("No current song playing in Nightbot")
@@ -725,12 +789,12 @@ func (server *Server) watchMusic() {
 					}
 				}
 			}
-			
+
 			// Use the cached Nightbot song if available
 			if lastNightbotSong != nil {
 				song = lastNightbotSong
 			}
-			
+
 			// Always check for window-based players to detect when songs stop
 			// Check context before performing window search
 			select {
@@ -739,14 +803,14 @@ func (server *Server) watchMusic() {
 			default:
 				// Context still valid, continue with window search
 			}
-			
+
 			windows, err := winapi.FindWindowsByProcess(
 				[]string{tidal, spotify},
 				winapi.WinVisible(true),
 				winapi.WinClass("Chrome_WidgetWin_1"),
 				winapi.WinTitlePattern(*regexp.MustCompile("-")),
 			)
-			
+
 			var foundWindowSong bool
 			if err != nil {
 				log.Printf("Error finding windows: %v", err)
@@ -774,7 +838,7 @@ func (server *Server) watchMusic() {
 						break
 					}
 				}
-				
+
 				// If no window song found and last Nightbot poll was a while ago,
 				// clear the lastNightbotSong to ensure we don't keep stale state
 				if !foundWindowSong && lastNightbotSong != nil && now.Sub(lastNightbotPoll) >= (nightbotPollInterval*2) {
