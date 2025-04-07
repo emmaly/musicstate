@@ -235,7 +235,11 @@
     let ws;
 
     function connectWebSocket() {
-      ws = new WebSocket('ws://localhost:52846/ws');
+      // Use relative protocol and current host
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${location.host}/ws`;
+      console.log(`Connecting to WebSocket at ${wsUrl}`);
+      ws = new WebSocket(wsUrl);
 
       ws.onopen = function() {
         console.log('Connected to server');
