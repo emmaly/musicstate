@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -29,8 +31,10 @@ var (
 )
 
 var (
-	enumCallback uintptr     // Store our callback
-	windowsChan  chan Window // Channel for passing windows during enumeration
+	enumCallback uintptr              // Store our callback
+	windowsChan  chan Window          // Channel for passing windows during enumeration
+	callbackMap  = make(map[uintptr]bool) // Track active callbacks to prevent GC
+	callbackMu   sync.Mutex           // Protects the callback map
 )
 
 const (
@@ -57,7 +61,10 @@ type WindowRect struct {
 }
 
 func init() {
-	// Create our callback once
+	// Initialize windowsChan to prevent nil pointer panics
+	windowsChan = make(chan Window, 100)
+	
+	// Create our callback once and store it to prevent garbage collection
 	enumCallback = syscall.NewCallback(func(hwnd uintptr, lparam uintptr) uintptr {
 		if hwnd == 0 {
 			return 1
@@ -74,11 +81,21 @@ func init() {
 			}
 
 			if err := w.Update(); err == nil {
-				windowsChan <- w
+				// Non-blocking send to channel
+				select {
+				case windowsChan <- w:
+				default:
+					// Channel is full or closed, skip this window
+				}
 			}
 		}
 		return 1
 	})
+	
+	// Store the callback in our map to prevent garbage collection
+	callbackMu.Lock()
+	callbackMap[enumCallback] = true
+	callbackMu.Unlock()
 }
 
 // FindWindowsByProcess returns all windows belonging to the specified processes that pass the provided filters
@@ -89,7 +106,30 @@ func FindWindowsByProcess(processNames []string, filters ...Filter) ([]Window, e
 		processMap[strings.ToLower(name)] = true
 	}
 
-	cb := syscall.NewCallback(func(hwnd uintptr, lparam uintptr) uintptr {
+	// Use a static callback to avoid GC issues with callback function pointers
+	var done uintptr
+	windowsChan = make(chan Window, 50) // Buffer to prevent blocking
+	
+	// Start a goroutine to collect windows from the channel
+	go func() {
+		for w := range windowsChan {
+			matchesFilters := true
+			for _, filter := range filters {
+				if !filter(&w) {
+					matchesFilters = false
+					break
+				}
+			}
+			
+			if matchesFilters {
+				windows = append(windows, w)
+			}
+		}
+		done = 1
+	}()
+	
+	// Create a filtered callback that only processes our target applications
+	callback := syscall.NewCallback(func(hwnd uintptr, lparam uintptr) uintptr {
 		if hwnd == 0 {
 			return 1
 		}
@@ -106,22 +146,38 @@ func FindWindowsByProcess(processNames []string, filters ...Filter) ([]Window, e
 				ProcessName: name,
 			}
 
-			if err := w.Update(); err != nil {
-				return 1
-			}
-
-			for _, filter := range filters {
-				if !filter(&w) {
-					return 1
+			if err := w.Update(); err == nil {
+				select {
+				case windowsChan <- w:
+				default:
+					// Channel is full, skip this window
 				}
 			}
-
-			windows = append(windows, w)
 		}
 		return 1
 	})
-
-	enumWindows.Call(cb, 0)
+	
+	// Store the callback in our map to prevent garbage collection
+	callbackMu.Lock()
+	callbackMap[callback] = true
+	callbackMu.Unlock()
+	
+	// Use our new callback
+	enumWindows.Call(callback, 0)
+	
+	// Remove the callback from our map after enumeration completes
+	defer func() {
+		callbackMu.Lock()
+		delete(callbackMap, callback)
+		callbackMu.Unlock()
+	}()
+	
+	// Close the channel and wait for collection to complete
+	close(windowsChan)
+	for done == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	
 	return windows, nil
 }
 
@@ -138,17 +194,35 @@ func getWindowText(hwnd uintptr) string {
 	if length == 0 {
 		return ""
 	}
+	
+	// Safety cap for extremely large window titles to prevent allocation issues
+	// Windows typically doesn't have window titles longer than 1000 chars
+	if length > 4096 {
+		length = 4096
+	}
 
 	// Allocate buffer for text (+1 for null terminator)
 	buf := make([]uint16, length+1)
 
 	// Get window text
-	getWindowTextW.Call(
+	result, _, _ := getWindowTextW.Call(
 		hwnd,
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(length+1),
 	)
+	
+	// If result is 0, the call failed
+	if result == 0 {
+		return ""
+	}
 
+	// Only convert the valid portion of the buffer
+	actualLength := int(result)
+	if actualLength > 0 && actualLength <= length {
+		return syscall.UTF16ToString(buf[:actualLength])
+	}
+	
+	// Fallback to converting the whole buffer (minus null terminator)
 	return syscall.UTF16ToString(buf)
 }
 
@@ -180,8 +254,13 @@ func getProcessExecutableName(pid uint32) (string, error) {
 	return filepath.Base(fullPath), nil
 }
 
-// getWindowRect retrieves the window dimensions
+// updateRect retrieves the window dimensions
 func (w *Window) updateRect() error {
+	// Check if the handle is valid
+	if w.Handle == 0 {
+		return fmt.Errorf("invalid window handle")
+	}
+	
 	var rect WindowRect
 	ret, _, err := getWindowRect.Call(
 		w.Handle,
@@ -196,6 +275,11 @@ func (w *Window) updateRect() error {
 
 // updateVisibility checks if window is visible
 func (w *Window) updateVisibility() error {
+	// Check if the handle is valid
+	if w.Handle == 0 {
+		return fmt.Errorf("invalid window handle")
+	}
+	
 	ret, _, _ := isWindowVisible.Call(w.Handle)
 	w.IsVisible = ret != 0
 	return nil
@@ -203,6 +287,11 @@ func (w *Window) updateVisibility() error {
 
 // updateClassName gets the window class name
 func (w *Window) updateClassName() error {
+	// Check if the handle is valid
+	if w.Handle == 0 {
+		return fmt.Errorf("invalid window handle")
+	}
+	
 	var buf [256]uint16
 	ret, _, err := getClassName.Call(
 		w.Handle,
@@ -212,7 +301,13 @@ func (w *Window) updateClassName() error {
 	if ret == 0 {
 		return fmt.Errorf("GetClassName failed: %v", err)
 	}
-	w.ClassName = syscall.UTF16ToString(buf[:])
+	
+	// Only use the valid portion of the buffer (up to the returned length)
+	if ret > 0 && ret <= 256 {
+		w.ClassName = syscall.UTF16ToString(buf[:ret])
+	} else {
+		w.ClassName = syscall.UTF16ToString(buf[:])
+	}
 	return nil
 }
 
