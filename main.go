@@ -772,8 +772,15 @@ func FindAppleMusicTitle() (string, error) {
 		if err == nil && len(windows) > 0 {
 			// Check for Apple Music in title
 			for _, w := range windows {
-				if strings.Contains(w.Title, "Apple Music") {
-					return w.Title, nil
+				title := w.Title
+
+				// Only consider titles that have "Apple Music"
+				if strings.Contains(title, "Apple Music") {
+					// Music pages typically have both " by " and at least 2 hyphens
+					// For example: "Song - Album - Apple Music" or "Song - Single by Artist - Apple Music"
+					if strings.Contains(title, " by ") && strings.Count(title, "-") >= 2 {
+						return title, nil
+					}
 				}
 			}
 		}
