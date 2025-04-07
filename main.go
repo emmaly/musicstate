@@ -41,9 +41,17 @@ type SongUpdate struct {
 	AlbumArt string `json:"albumArt"` // Only used for "change"
 }
 
+// ConnectionState represents the state of a WebSocket connection
+type ConnectionState struct {
+	Conn      *websocket.Conn
+	IsActive  bool
+	LastPing  time.Time
+	CloseOnce sync.Once  // Ensures we only close once
+}
+
 type Server struct {
 	song        *Song
-	connections []*websocket.Conn
+	connections []*ConnectionState
 	mu          sync.Mutex
 }
 
@@ -79,6 +87,9 @@ func wsHandler() http.HandlerFunc {
 
 	// Start watching for music changes
 	go server.watchMusic()
+	
+	// Start a connection health checker
+	go server.connectionHealthCheck()
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -86,13 +97,49 @@ func wsHandler() http.HandlerFunc {
 			log.Println("Upgrade error:", err)
 			return
 		}
-		defer conn.Close()
+		
+		// Set up ping handler to track connection health
+		conn.SetPingHandler(func(appData string) error {
+			// Update the connection's last ping time
+			connState := server.findConnection(conn)
+			if connState != nil {
+				server.mu.Lock()
+				connState.LastPing = time.Now()
+				connState.IsActive = true
+				server.mu.Unlock()
+			}
+			return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
+		})
+		
+		// Set reasonable timeouts
+		conn.SetReadLimit(1024) // Limit incoming message sizes
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetPongHandler(func(string) error {
+			// Reset the read deadline when we get a pong
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			return nil
+		})
 
-		server.addConnection(conn)
-		defer server.removeConnection(conn)
+		// Create connection state and add to server
+		connState := &ConnectionState{
+			Conn:     conn,
+			IsActive: true,
+			LastPing: time.Now(),
+		}
+		server.addConnection(connState)
+		
+		// Ensure connection is properly cleaned up when this handler exits
+		defer func() {
+			server.removeConnection(connState) 
+			connState.CloseOnce.Do(func() {
+				conn.Close()
+				log.Println("WebSocket connection closed and cleaned up")
+			})
+		}()
 
 		// Send the current state to the new connection
 		var update SongUpdate
+		server.mu.Lock()
 		if server.song != nil {
 			update = server.song.AsSongUpdate()
 			log.Printf("Sending current song to new connection: %s - %s", server.song.Artist, server.song.Song)
@@ -100,10 +147,11 @@ func wsHandler() http.HandlerFunc {
 			update = SongUpdate{Type: "stop"}
 			log.Println("Sending stop state to new connection (no song playing)")
 		}
+		server.mu.Unlock()
 		
 		err = conn.WriteJSON(update)
 		if err != nil {
-			log.Println("Write error:", err)
+			log.Println("Initial write error:", err)
 			return
 		}
 
@@ -111,9 +159,22 @@ func wsHandler() http.HandlerFunc {
 		for {
 			_, _, err := conn.ReadMessage()
 			if err != nil {
-				log.Println("Read error:", err)
+				if websocket.IsUnexpectedCloseError(err, 
+					websocket.CloseGoingAway, 
+					websocket.CloseNormalClosure) {
+					log.Printf("Read error: %v", err)
+				}
 				break
 			}
+			
+			// Reset deadlines on successful read
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			
+			// Update last activity timestamp
+			server.mu.Lock()
+			connState.LastPing = time.Now()
+			connState.IsActive = true
+			server.mu.Unlock()
 		}
 	}
 }
@@ -133,20 +194,24 @@ func (s *Song) AsSongUpdate() SongUpdate {
 
 func (server *Server) reportMusic(song *Song) {
 	server.mu.Lock()
-	defer server.mu.Unlock()
 
+	// Check if there's any change that requires updating clients
 	if (server.song == nil && song == nil) ||
 		(server.song != nil &&
 			song != nil &&
 			server.song.Song == song.Song &&
 			server.song.Artist == song.Artist &&
 			server.song.AlbumArt == song.AlbumArt) {
+		server.mu.Unlock()
 		return // nothing to do
 	}
 
+	// Update the stored song
 	server.song = song
 
-	if server.connections == nil {
+	// Check if we have any connections
+	if server.connections == nil || len(server.connections) == 0 {
+		server.mu.Unlock()
 		return
 	}
 
@@ -160,27 +225,125 @@ func (server *Server) reportMusic(song *Song) {
 		log.Printf("Sending song update: %s - %s", song.Artist, song.Song)
 	}
 
+	// Copy connection slice to avoid holding the lock during writes
+	connections := make([]*ConnectionState, len(server.connections))
+	copy(connections, server.connections)
+	server.mu.Unlock()
+
+	// Track dead connections to clean up after sending messages
+	var deadConnections []*ConnectionState
+	
 	// Send to all connected clients
-	for _, conn := range server.connections {
-		err := conn.WriteJSON(update)
+	for _, connState := range connections {
+		// Skip already known inactive connections
+		if !connState.IsActive {
+			continue
+		}
+		
+		// Set a write deadline
+		connState.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		
+		err := connState.Conn.WriteJSON(update)
 		if err != nil {
-			log.Println("Write error:", err)
+			log.Printf("Write error to client: %v", err)
+			connState.IsActive = false
+			deadConnections = append(deadConnections, connState)
+		}
+	}
+	
+	// Clean up any connections that failed during this update
+	if len(deadConnections) > 0 {
+		log.Printf("Cleaning up %d dead connections after update", len(deadConnections))
+		for _, connState := range deadConnections {
+			server.removeConnection(connState)
+			connState.CloseOnce.Do(func() {
+				connState.Conn.Close()
+			})
 		}
 	}
 }
 
-func (server *Server) addConnection(conn *websocket.Conn) {
+// connectionHealthCheck periodically checks connection health and cleans up dead connections
+func (server *Server) connectionHealthCheck() {
+	const (
+		healthCheckInterval = 30 * time.Second
+		connectionTimeout   = 120 * time.Second
+	)
+	
+	log.Println("Starting WebSocket connection health checker")
+	
+	for {
+		time.Sleep(healthCheckInterval)
+		
+		server.mu.Lock()
+		if server.connections == nil || len(server.connections) == 0 {
+			server.mu.Unlock()
+			continue
+		}
+		
+		now := time.Now()
+		deadConnections := []*ConnectionState{}
+		
+		// Identify dead connections
+		for _, connState := range server.connections {
+			// If it's been too long since the last ping/activity
+			if now.Sub(connState.LastPing) > connectionTimeout {
+				log.Printf("Connection inactive for %v, marking as dead", now.Sub(connState.LastPing))
+				connState.IsActive = false
+				deadConnections = append(deadConnections, connState)
+			} else {
+				// Ping the connection to keep it alive and verify it's still working
+				deadline := time.Now().Add(5 * time.Second)
+				err := connState.Conn.WriteControl(websocket.PingMessage, []byte{}, deadline)
+				if err != nil {
+					log.Printf("Failed to ping connection: %v", err)
+					connState.IsActive = false
+					deadConnections = append(deadConnections, connState)
+				}
+			}
+		}
+		
+		server.mu.Unlock()
+		
+		// Clean up dead connections
+		for _, connState := range deadConnections {
+			log.Println("Cleaning up dead connection")
+			server.removeConnection(connState)
+			
+			// Safe close
+			connState.CloseOnce.Do(func() {
+				connState.Conn.Close()
+			})
+		}
+	}
+}
+
+// findConnection looks up a connection by its conn pointer
+func (server *Server) findConnection(conn *websocket.Conn) *ConnectionState {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	
+	for _, connState := range server.connections {
+		if connState.Conn == conn {
+			return connState
+		}
+	}
+	return nil
+}
+
+func (server *Server) addConnection(connState *ConnectionState) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 
 	if server.connections == nil {
-		server.connections = make([]*websocket.Conn, 0)
+		server.connections = make([]*ConnectionState, 0, 10) // Pre-allocate some capacity
 	}
 
-	server.connections = append(server.connections, conn)
+	server.connections = append(server.connections, connState)
+	log.Printf("Added new connection, total connections: %d", len(server.connections))
 }
 
-func (server *Server) removeConnection(conn *websocket.Conn) {
+func (server *Server) removeConnection(connState *ConnectionState) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 
@@ -188,12 +351,21 @@ func (server *Server) removeConnection(conn *websocket.Conn) {
 		return
 	}
 
-	for i, c := range server.connections {
-		if c == conn {
-			server.connections = append(server.connections[:i], server.connections[i+1:]...)
-			break
+	// Make a copy of the slice to avoid memory leaks
+	newConnections := make([]*ConnectionState, 0, len(server.connections)-1)
+	
+	for _, cs := range server.connections {
+		if cs != connState {
+			newConnections = append(newConnections, cs)
 		}
 	}
+	
+	// If we removed a connection, log it
+	if len(newConnections) < len(server.connections) {
+		log.Printf("Removed connection, remaining connections: %d", len(newConnections))
+	}
+	
+	server.connections = newConnections
 }
 
 func (server *Server) watchMusic() {
