@@ -255,10 +255,14 @@ func (server *Server) reportMusic(song *Song) {
 	if len(deadConnections) > 0 {
 		log.Printf("Cleaning up %d dead connections after update", len(deadConnections))
 		for _, connState := range deadConnections {
-			server.removeConnection(connState)
-			connState.CloseOnce.Do(func() {
-				connState.Conn.Close()
-			})
+			if connState != nil {
+				server.removeConnection(connState)
+				connState.CloseOnce.Do(func() {
+					if connState.Conn != nil {
+						connState.Conn.Close()
+					}
+				})
+			}
 		}
 	}
 }
@@ -306,14 +310,21 @@ func (server *Server) connectionHealthCheck() {
 		server.mu.Unlock()
 		
 		// Clean up dead connections
-		for _, connState := range deadConnections {
-			log.Println("Cleaning up dead connection")
-			server.removeConnection(connState)
-			
-			// Safe close
-			connState.CloseOnce.Do(func() {
-				connState.Conn.Close()
-			})
+		if len(deadConnections) > 0 {
+			log.Printf("Found %d dead connections to clean up", len(deadConnections))
+			for _, connState := range deadConnections {
+				if connState != nil {
+					log.Println("Cleaning up dead connection")
+					server.removeConnection(connState)
+					
+					// Safe close with nil check
+					connState.CloseOnce.Do(func() {
+						if connState.Conn != nil {
+							connState.Conn.Close()
+						}
+					})
+				}
+			}
 		}
 	}
 }
@@ -347,22 +358,42 @@ func (server *Server) removeConnection(connState *ConnectionState) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 
-	if server.connections == nil {
+	// Safety check for nil or empty connections slice
+	if server.connections == nil || len(server.connections) == 0 {
+		return
+	}
+	
+	// If we're removing the only connection, just set to empty slice
+	if len(server.connections) == 1 && server.connections[0] == connState {
+		log.Println("Removed last connection, connections now empty")
+		server.connections = make([]*ConnectionState, 0)
 		return
 	}
 
 	// Make a copy of the slice to avoid memory leaks
-	newConnections := make([]*ConnectionState, 0, len(server.connections)-1)
+	// Use max(0, len-1) to ensure capacity is never negative
+	capacity := len(server.connections)
+	if capacity > 0 {
+		capacity--
+	}
 	
+	newConnections := make([]*ConnectionState, 0, capacity)
+	
+	// Only append connections that don't match the one we're removing
+	var removed bool
 	for _, cs := range server.connections {
 		if cs != connState {
 			newConnections = append(newConnections, cs)
+		} else {
+			removed = true
 		}
 	}
 	
-	// If we removed a connection, log it
-	if len(newConnections) < len(server.connections) {
+	// If we actually removed a connection, log it
+	if removed {
 		log.Printf("Removed connection, remaining connections: %d", len(newConnections))
+	} else {
+		log.Println("Connection not found in list, no connection removed")
 	}
 	
 	server.connections = newConnections
