@@ -42,14 +42,14 @@ func main() {
 	// Start local server to receive callback
 	var token *oauth2.Token
 	tokenChan := make(chan *oauth2.Token)
-	
+
 	// Parse the redirect URL to get host and port
 	redirectParts := strings.Split(strings.TrimPrefix(redirectURL, "http://"), ":")
 	if len(redirectParts) != 2 {
 		log.Fatalf("Invalid redirect URL format. Should be http://hostname:port (example: http://localhost:9182)")
 	}
 	listenAddr := ":" + redirectParts[1]
-	
+
 	// Create a server to listen for the OAuth2 callback
 	server := &http.Server{Addr: listenAddr}
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

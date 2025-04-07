@@ -30,7 +30,7 @@ type Client struct {
 
 // SongRequestQueue represents the Nightbot song request queue
 type SongRequestQueue struct {
-	CurrentSong *SongRequest `json:"_currentSong"`
+	CurrentSong *SongRequest  `json:"_currentSong"`
 	Queue       []SongRequest `json:"_queue"`
 }
 
@@ -111,7 +111,7 @@ func (c *Client) GetCurrentSong() (*musicstate.NowPlaying, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %w", err)
 	}
-	
+
 	// Log the full API response
 	log.Printf("Nightbot API response: %s", string(bodyBytes))
 
@@ -128,14 +128,14 @@ func (c *Client) GetCurrentSong() (*musicstate.NowPlaying, error) {
 	}
 
 	// Include requester name in the log
-	log.Printf("Current Nightbot song: %s - %s (requested by %s)", 
-		queue.CurrentSong.Track.Artist, 
+	log.Printf("Current Nightbot song: %s - %s (requested by %s)",
+		queue.CurrentSong.Track.Artist,
 		queue.CurrentSong.Track.Title,
 		queue.CurrentSong.User.Name)
 
 	// Format artist with requester information
-	artistWithRequester := fmt.Sprintf("%s (requested by %s)", 
-		queue.CurrentSong.Track.Artist, 
+	artistWithRequester := fmt.Sprintf("%s (requested by %s)",
+		queue.CurrentSong.Track.Artist,
 		queue.CurrentSong.User.Name)
 
 	return &musicstate.NowPlaying{
@@ -151,7 +151,7 @@ func (c *Client) RefreshToken() error {
 		log.Println("No token available for refresh")
 		return errors.New("no token available")
 	}
-	
+
 	if !c.token.Valid() {
 		log.Println("Token expired, attempting to refresh...")
 		newToken, err := c.config.TokenSource(context.Background(), c.token).Token()
@@ -165,7 +165,7 @@ func (c *Client) RefreshToken() error {
 		c.httpClient = c.config.Client(context.Background(), newToken)
 		return nil
 	}
-	
+
 	// Token is still valid
 	log.Printf("Token valid until: %v", c.token.Expiry)
 	return nil
@@ -200,15 +200,15 @@ func (p *NightbotPlayer) ParseWindowTitle(title string) (*musicstate.NowPlaying,
 // GetCurrentTrack gets the current track from Nightbot API
 func (p *NightbotPlayer) GetCurrentTrack() (*musicstate.NowPlaying, error) {
 	log.Println("Nightbot player: checking for current track")
-	
+
 	// Check if token needs refresh
 	if p.client.token != nil {
 		now := time.Now()
 		log.Printf("Token expiry: %v (in %v)", p.client.token.Expiry, p.client.token.Expiry.Sub(now))
-		log.Printf("Token: access=%s... refresh=%s...", 
-			p.client.token.AccessToken[:10], 
+		log.Printf("Token: access=%s... refresh=%s...",
+			p.client.token.AccessToken[:10],
 			p.client.token.RefreshToken[:10])
-		
+
 		if !p.client.token.Valid() {
 			log.Println("Token needs refresh")
 			if err := p.client.RefreshToken(); err != nil {
@@ -233,7 +233,7 @@ func (p *NightbotPlayer) GetCurrentTrack() (*musicstate.NowPlaying, error) {
 		}
 		return nil, err
 	}
-	
+
 	log.Printf("Successfully retrieved Nightbot track: %s - %s", track.Artist, track.Title)
 	return track, nil
 }
