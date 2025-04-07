@@ -176,6 +176,20 @@ func FindWindowsByProcess(processNames []string, filters ...Filter) ([]Window, e
 	callbackMap[callback] = true
 	callbackMu.Unlock()
 
+	// Set up cleanup in defer to ensure it runs even on panic or early return
+	// This ensures callbacks are always properly removed
+	defer func() {
+		// Remove the callback from our map after enumeration completes
+		callbackMu.Lock()
+		delete(callbackMap, callback)
+		callbackMu.Unlock()
+
+		// Clear the global channel reference
+		globalWindowsMu.Lock()
+		globalWindowsChan = nil
+		globalWindowsMu.Unlock()
+	}()
+
 	// Set the global channel before enumeration
 	globalWindowsMu.Lock()
 	globalWindowsChan = windowsChan
@@ -183,18 +197,6 @@ func FindWindowsByProcess(processNames []string, filters ...Filter) ([]Window, e
 
 	// Use our new callback
 	enumWindows.Call(callback, 0)
-
-	// Remove the callback from our map after enumeration completes
-	defer func() {
-		callbackMu.Lock()
-		delete(callbackMap, callback)
-		callbackMu.Unlock()
-	}()
-
-	// Clear the global channel reference
-	globalWindowsMu.Lock()
-	globalWindowsChan = nil
-	globalWindowsMu.Unlock()
 
 	// Close the channel and wait for collection to complete
 	close(windowsChan)
@@ -313,6 +315,21 @@ func (w *Window) updateVisibility() error {
 	ret, _, _ := isWindowVisible.Call(w.Handle)
 	w.IsVisible = ret != 0
 	return nil
+}
+
+// Cleanup releases all stored callbacks to prevent memory leaks
+// Call this during application shutdown
+func Cleanup() {
+	callbackMu.Lock()
+	defer callbackMu.Unlock()
+
+	// Clear the map to release all callbacks
+	callbackMap = make(map[uintptr]bool)
+
+	// Clear global channel reference
+	globalWindowsMu.Lock()
+	globalWindowsChan = nil
+	globalWindowsMu.Unlock()
 }
 
 // updateClassName gets the window class name

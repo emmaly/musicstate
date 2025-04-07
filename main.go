@@ -30,33 +30,33 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		// Get the origin header
 		origin := r.Header.Get("Origin")
-		
+
 		// Allow requests with no origin (like file:// or native applications like OBS)
 		if origin == "" {
 			return true
 		}
-		
+
 		// Parse the origin URL
 		originURL, err := url.Parse(origin)
 		if err != nil {
 			log.Printf("Invalid origin: %s - %v", origin, err)
 			return false
 		}
-		
+
 		// Get the host from the request
 		requestHost := r.Host
-		
+
 		// Allow same-origin requests (same hostname)
 		if originURL.Host == requestHost {
 			return true
 		}
-		
+
 		// Allow localhost for development
-		if strings.HasPrefix(originURL.Host, "localhost:") || 
-		   strings.HasPrefix(originURL.Host, "127.0.0.1:") {
+		if strings.HasPrefix(originURL.Host, "localhost:") ||
+			strings.HasPrefix(originURL.Host, "127.0.0.1:") {
 			return true
 		}
-		
+
 		// Log rejected origins
 		log.Printf("Rejected WebSocket connection from origin: %s", origin)
 		return false
@@ -104,6 +104,8 @@ func main() {
 	// Create a root context with cancellation for application-wide shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Clean up WinAPI resources on application exit
+	defer winapi.Cleanup()
 
 	// Create a mux for routing
 	mux := http.NewServeMux()
