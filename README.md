@@ -1,10 +1,10 @@
 # SorceressEmmaly's MusicState - a music visualization overlay for streams
 
-A sleek music visualization overlay for your streams that shows what's currently playing in TIDAL, Spotify, or Apple Music.
+A sleek music visualization overlay for your streams that shows what's currently playing in TIDAL or Spotify.
 
 ## Features
 
-- Shows current song and artist information from TIDAL, Spotify, Apple Music, or Nightbot's song request system
+- Shows current song and artist information from TIDAL, Spotify, or Nightbot's song request system
 - Smooth animations for song changes
 - Customizable appearance including:
   - Position on screen (9 different anchor points)
@@ -21,7 +21,7 @@ A sleek music visualization overlay for your streams that shows what's currently
 1. Download and run the application
 2. It will start a local web server and display the URL to use (typically `http://localhost:52846`)
 3. Add this URL as a browser source in your streaming software
-4. Play music in TIDAL, Spotify, Apple Music in browser, or Nightbot
+4. Play music in TIDAL, Spotify, or Nightbot
 5. The overlay will automatically detect and display currently playing songs
 
 If port 52846 is already in use or blocked, you can specify an alternative port by setting the `MUSICSTATE_PORT` environment variable:
@@ -124,10 +124,8 @@ The application will automatically detect and show songs from Nightbot when avai
 
 - Currently only supports Windows _(for now)_
 - Desktop player support: Works with TIDAL and Spotify desktop applications
-- Web player support: Works with Apple Music in any major browser (Chrome, Firefox, Edge, Opera, Brave)
 - API support: Works with Nightbot's song request system
 - For desktop players: Requires the applications to be running and playing music
-- For Apple Music: Requires browser tab with Apple Music to be open
 - For Nightbot: Requires OAuth2 authentication (see Nightbot integration docs)
 
 ## Contributing

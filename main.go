@@ -1,16 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -109,9 +112,82 @@ func main() {
 	// Create a mux for routing
 	mux := http.NewServeMux()
 
+	// Initialize a file logger for POST requests
+	logDir := os.Getenv("MUSICSTATE_LOG_DIR")
+	if logDir == "" {
+		// Use the executable directory by default
+		execPath, err := os.Executable()
+		if err == nil {
+			logDir = filepath.Dir(execPath)
+		} else {
+			// Fallback to current directory
+			logDir = "."
+		}
+	}
+	logFilePath := filepath.Join(logDir, "musicstate_http.log")
+	fileLogger, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Warning: Failed to open log file: %v, using stdout instead", err)
+		fileLogger = nil
+	} else {
+		log.Printf("HTTP POST requests will be logged to: %s", logFilePath)
+	}
+
 	fileServer := http.FileServer(http.FS(staticFiles))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Rewrite the path to include "static"
+		// Log POST requests as pretty-printed JSON
+		if r.Method == http.MethodPost {
+			// Read the request body
+			bodyBytes, err := io.ReadAll(r.Body)
+			if err != nil {
+				log.Printf("Error reading request body: %v", err)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+			// Close the original body
+			r.Body.Close()
+			
+			// Create a new body reader for later use
+			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+			
+			// Pretty print the JSON
+			var prettyJSON bytes.Buffer
+			if json.Valid(bodyBytes) {
+				var jsonObj interface{}
+				if err := json.Unmarshal(bodyBytes, &jsonObj); err == nil {
+					encoder := json.NewEncoder(&prettyJSON)
+					encoder.SetIndent("", "  ")
+					if err := encoder.Encode(jsonObj); err == nil {
+						// Log to file if available
+						if fileLogger != nil {
+							timestamp := time.Now().Format("2006-01-02 15:04:05")
+							logMsg := fmt.Sprintf("[%s] POST /\nFrom: %s\nData:\n%s\n", 
+								timestamp, r.RemoteAddr, prettyJSON.String())
+							if _, err := fileLogger.WriteString(logMsg); err != nil {
+								log.Printf("Error writing to log file: %v", err)
+							}
+						} else {
+							// Log to stdout if file logging failed
+							log.Printf("POST / from %s with data:\n%s", r.RemoteAddr, prettyJSON.String())
+						}
+					}
+				}
+			} else {
+				// Log non-JSON content
+				if fileLogger != nil {
+					timestamp := time.Now().Format("2006-01-02 15:04:05")
+					logMsg := fmt.Sprintf("[%s] POST / (non-JSON)\nFrom: %s\nData: %s\n", 
+						timestamp, r.RemoteAddr, string(bodyBytes))
+					if _, err := fileLogger.WriteString(logMsg); err != nil {
+						log.Printf("Error writing to log file: %v", err)
+					}
+				} else {
+					log.Printf("POST / from %s with non-JSON data: %s", r.RemoteAddr, string(bodyBytes))
+				}
+			}
+		}
+		
+		// Regular static file serving
 		r.URL.Path = "/static" + r.URL.Path
 		fileServer.ServeHTTP(w, r)
 	})
@@ -173,6 +249,13 @@ func main() {
 	// Wait for server to complete shutdown
 	<-serverStopCtx.Done()
 	log.Println("Server shutdown complete")
+	
+	// Close the file logger if it was opened
+	if fileLogger != nil {
+		if err := fileLogger.Close(); err != nil {
+			log.Printf("Error closing log file: %v", err)
+		}
+	}
 }
 
 func wsHandler() http.HandlerFunc {
@@ -751,43 +834,6 @@ func FindTidalTitle() (string, error) {
 	return "", fmt.Errorf("no TIDAL window with title found")
 }
 
-// FindAppleMusicTitle finds Apple Music window title
-func FindAppleMusicTitle() (string, error) {
-	// Known browser processes
-	browserProcesses := []string{
-		"chrome.exe",
-		"msedge.exe",
-		"firefox.exe",
-		"opera.exe",
-		"brave.exe",
-	}
-
-	// Find browser windows with Apple Music
-	for _, browser := range browserProcesses {
-		windows, err := winapi.FindWindowsByProcess(
-			[]string{browser},
-			winapi.WinVisible(true),
-		)
-
-		if err == nil && len(windows) > 0 {
-			// Check for Apple Music in title
-			for _, w := range windows {
-				title := w.Title
-
-				// Only consider titles that have "Apple Music"
-				if strings.Contains(title, "Apple Music") {
-					// Music pages typically have both " by " and at least 2 hyphens
-					// For example: "Song - Album - Apple Music" or "Song - Single by Artist - Apple Music"
-					if strings.Contains(title, " by ") && strings.Count(title, "-") >= 2 {
-						return title, nil
-					}
-				}
-			}
-		}
-	}
-
-	return "", fmt.Errorf("no browser window with Apple Music found")
-}
 
 // ParseSpotifyTitle parses a Spotify window title
 func ParseSpotifyTitle(title string) *Song {
@@ -845,56 +891,6 @@ func ParseTidalTitle(title string) *Song {
 	}
 }
 
-// ParseAppleMusicTitle parses an Apple Music window title
-func ParseAppleMusicTitle(title string) *Song {
-	if title == "" || !strings.Contains(title, "Apple Music") {
-		return nil
-	}
-
-	// Remove browser suffix
-	appleIndex := strings.Index(title, "Apple Music")
-	if appleIndex > 0 {
-		title = title[:appleIndex+11]
-	}
-
-	// Remove " - Apple Music" suffix
-	title = strings.TrimSuffix(title, " - Apple Music")
-	title = strings.TrimSpace(title)
-
-	// Try to find artist with " by " separator
-	byParts := strings.Split(title, " by ")
-	if len(byParts) >= 2 {
-		artist := strings.TrimSpace(byParts[len(byParts)-1])
-
-		// Handle the song title part
-		songTitle := strings.Join(byParts[:len(byParts)-1], " by ")
-
-		// Clean up song title
-		// Remove " - Album" or " - Single" if present
-		for _, suffix := range []string{" - Album", " - Single", " - EP"} {
-			if idx := strings.LastIndex(songTitle, suffix); idx >= 0 {
-				songTitle = songTitle[:idx]
-				break
-			}
-		}
-
-		// Clean up any invisible characters
-		if len(songTitle) > 0 && songTitle[0] < 32 {
-			songTitle = songTitle[1:]
-		}
-
-		return &Song{
-			Artist: artist,
-			Song:   strings.TrimSpace(songTitle),
-		}
-	}
-
-	// Fallback if no " by " found
-	return &Song{
-		Artist: "Unknown Artist",
-		Song:   title,
-	}
-}
 
 func (server *Server) watchMusic() {
 	log.Println("Starting watchMusic function...")
@@ -1057,21 +1053,6 @@ func (server *Server) watchMusic() {
 				}
 			}
 
-			// Try to find Apple Music if no song yet
-			if !foundWindowSong {
-				debugLog("Checking Apple Music...")
-				appleMusicTitle, appleErr := FindAppleMusicTitle()
-				if appleErr == nil && appleMusicTitle != "" {
-					debugLog("Found Apple Music title: %s", appleMusicTitle)
-					if appleSong := ParseAppleMusicTitle(appleMusicTitle); appleSong != nil {
-						foundWindowSong = true
-						if song == nil {
-							song = appleSong
-							debugLog("Using Apple Music song: %s - %s", song.Artist, song.Song)
-						}
-					}
-				}
-			}
 
 			// If no window song found and last Nightbot poll was a while ago,
 			// clear the lastNightbotSong to ensure we don't keep stale state
