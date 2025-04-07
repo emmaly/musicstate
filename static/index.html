@@ -241,9 +241,21 @@
       console.log(`Connecting to WebSocket at ${wsUrl}`);
       ws = new WebSocket(wsUrl);
 
+      let pingInterval;
+      let pingCounter = 0;
+
       ws.onopen = function() {
         console.log('Connected to server');
         clearTimeout(failedConnectionTimeout);
+
+        pingCounter = 0;
+        pingInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping', id: pingCounter++ }));
+          } else {
+            clearInterval(pingInterval);
+          }
+        }, 5000);
       };
 
       ws.onmessage = function(event) {
@@ -257,6 +269,8 @@
       };
 
       ws.onclose = function() {
+        clearInterval(pingInterval);
+
         console.log('Disconnected from server');
 
         // Attempt to reconnect after 5 seconds
@@ -292,14 +306,20 @@
       songDisplay.querySelector('.artist-name').textContent = artistName;
     }
 
+    // We've temporarily disabled debouncing to debug the issue
     async function songChange(artistName, songName, albumArt) {
       clearTimeout(currentTimeout);
+
+      console.log(`Song change received: ${artistName} - ${songName}`);
 
       // Check if unchanged
       if (!checkUpdateDisplay(artistName, songName, albumArt)) return; // nothing to do if unchanged
 
-      // If display is already active, animate it away first
-      if (songDisplay.classList.contains('active')) {
+      // If display is already active with same content, don't animate it away and back
+      const isSameContent = songDisplay.querySelector('.song-name').textContent === songName &&
+                           songDisplay.querySelector('.artist-name').textContent === artistName;
+
+      if (songDisplay.classList.contains('active') && !isSameContent) {
         songDisplay.classList.remove('active');
         await new Promise(resolve => setTimeout(resolve, dwellTime*0.5));
       }
@@ -316,8 +336,9 @@
     }
 
     async function songStop() {
-      console.log('Song stopped');
+      console.log('Song stopped - removing from display');
       clearTimeout(currentTimeout);
+
       songDisplay.classList.remove('active');
       lastUpdate = { artist: '', song: '', albumArt: '' }; // Reset last update
     }

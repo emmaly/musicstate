@@ -20,8 +20,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/emmaly/musicstate/musicstate"
 	"github.com/emmaly/musicstate/nightbot"
-	"github.com/emmaly/musicstate/winapi"
+	"github.com/emmaly/musicstate/webscrobbler"
 	"github.com/gorilla/websocket"
 	"golang.org/x/oauth2"
 )
@@ -30,10 +31,10 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		// Get the origin header
+		// Allow all origins
 		origin := r.Header.Get("Origin")
 
-		// Allow requests with no origin (like file:// or native applications like OBS)
+		// Allow requests with no origin (like mobile apps or curl)
 		if origin == "" {
 			return true
 		}
@@ -87,27 +88,102 @@ type ConnectionState struct {
 }
 
 type Server struct {
-	song        *Song
-	connections []*ConnectionState
-	mu          sync.RWMutex // Use RWMutex for better concurrency
-	ctx         context.Context
-	cancel      context.CancelFunc
+	song             *Song
+	connections      []*ConnectionState
+	webScrobbler     *webscrobbler.Scrobble
+	nightbotSong     *Song
+	lastNightbotPoll time.Time
+	mu               sync.RWMutex // Use RWMutex for better concurrency
+	ctx              context.Context
+	cancel           context.CancelFunc
 }
 
 // Constants for timeouts and intervals
 const (
-	DefaultTimeout = 10 * time.Second
+	DefaultTimeout      = 10 * time.Second
+	WebScrobblerTimeout = 3 * time.Minute // Timeout for Web Scrobbler data
+	DefaultNightbotPoll = 5 * time.Second // Default poll interval for Nightbot
 )
 
 //go:embed static/*
 var staticFiles embed.FS
 
+// Global server instance
+var globalServer *Server
+
+// Global Nightbot player
+var nightbotPlayer *nightbot.NightbotPlayer
+
+// handleHTTPPost processes POST requests from Web Scrobbler
+func handleHTTPPost(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Received POST request from %s", r.RemoteAddr)
+
+	// Only handle POST requests
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Read the request body
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("Error reading request body: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer r.Body.Close()
+
+	// Check if it's valid JSON
+	if !json.Valid(bodyBytes) {
+		log.Printf("Invalid JSON in POST request")
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Parse the JSON
+	scrobble, err := webscrobbler.ParseScrobble(bodyBytes)
+	if err != nil {
+		log.Printf("Error parsing JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Processing Web Scrobbler event: %s", scrobble.EventName)
+	log.Printf("Song details: Artist=%s, Track=%s, IsPlaying=%v",
+		scrobble.Data.Song.Parsed.Artist,
+		scrobble.Data.Song.Parsed.Track,
+		scrobble.Data.Song.Parsed.IsPlaying)
+
+	if globalServer != nil {
+		// Process the Web Scrobbler data
+		processWebScrobblerData(globalServer, &scrobble)
+	}
+
+	// Return success
+	w.WriteHeader(http.StatusOK)
+}
+
 func main() {
 	// Create a root context with cancellation for application-wide shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// Clean up WinAPI resources on application exit
-	defer winapi.Cleanup()
+
+	// Initialize the global server
+	globalServer = &Server{
+		ctx:    ctx,
+		cancel: cancel,
+	}
+
+	// Initialize Nightbot if environment variables are set
+	initNightbot()
+
+	// Start Web Scrobbler timeout checker
+	go globalServer.checkWebScrobblerTimeout()
+
+	// Start Nightbot music watcher if configured
+	if nightbotPlayer != nil {
+		go globalServer.watchNightbotMusic()
+	}
 
 	// Create a mux for routing
 	mux := http.NewServeMux()
@@ -134,6 +210,9 @@ func main() {
 	}
 
 	fileServer := http.FileServer(http.FS(staticFiles))
+
+	// Add a dedicated endpoint for Web Scrobbler
+	mux.HandleFunc("/webhook", handleHTTPPost)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// Log POST requests as pretty-printed JSON
 		if r.Method == http.MethodPost {
@@ -146,10 +225,10 @@ func main() {
 			}
 			// Close the original body
 			r.Body.Close()
-			
+
 			// Create a new body reader for later use
 			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-			
+
 			// Pretty print the JSON
 			var prettyJSON bytes.Buffer
 			if json.Valid(bodyBytes) {
@@ -161,7 +240,7 @@ func main() {
 						// Log to file if available
 						if fileLogger != nil {
 							timestamp := time.Now().Format("2006-01-02 15:04:05")
-							logMsg := fmt.Sprintf("[%s] POST /\nFrom: %s\nData:\n%s\n", 
+							logMsg := fmt.Sprintf("[%s] POST /\nFrom: %s\nData:\n%s\n",
 								timestamp, r.RemoteAddr, prettyJSON.String())
 							if _, err := fileLogger.WriteString(logMsg); err != nil {
 								log.Printf("Error writing to log file: %v", err)
@@ -170,13 +249,29 @@ func main() {
 							// Log to stdout if file logging failed
 							log.Printf("POST / from %s with data:\n%s", r.RemoteAddr, prettyJSON.String())
 						}
+
+						// Also process this as a Web Scrobbler request
+						if scrobble, err := webscrobbler.ParseScrobble(bodyBytes); err == nil {
+							log.Printf("******* WEBSCROBBLER POST TO ROOT PATH *******")
+							log.Printf("EVENT: %s, IsPlaying: %v, Artist: %s, Track: %s",
+								scrobble.EventName,
+								scrobble.Data.Song.Parsed.IsPlaying,
+								scrobble.Data.Song.Parsed.Artist,
+								scrobble.Data.Song.Parsed.Track)
+
+							// Process through the dedicated function
+							if globalServer != nil {
+								log.Printf("******* PROCESSING WEBSCROBBLER DATA FROM ROOT PATH *******")
+								processWebScrobblerData(globalServer, &scrobble)
+							}
+						}
 					}
 				}
 			} else {
 				// Log non-JSON content
 				if fileLogger != nil {
 					timestamp := time.Now().Format("2006-01-02 15:04:05")
-					logMsg := fmt.Sprintf("[%s] POST / (non-JSON)\nFrom: %s\nData: %s\n", 
+					logMsg := fmt.Sprintf("[%s] POST / (non-JSON)\nFrom: %s\nData: %s\n",
 						timestamp, r.RemoteAddr, string(bodyBytes))
 					if _, err := fileLogger.WriteString(logMsg); err != nil {
 						log.Printf("Error writing to log file: %v", err)
@@ -186,7 +281,7 @@ func main() {
 				}
 			}
 		}
-		
+
 		// Regular static file serving
 		r.URL.Path = "/static" + r.URL.Path
 		fileServer.ServeHTTP(w, r)
@@ -198,10 +293,10 @@ func main() {
 	// Try alternative port if default is unavailable
 	port := os.Getenv("MUSICSTATE_PORT")
 	if port == "" {
-		port = "52846"
+		port = "5284"
 	}
 	hostAddr := "localhost:" + port
-	fmt.Printf("SorceressEmmaly's MusicState\nCopyright (C) 2025 emmaly\nSee https://github.com/emmaly/musicstate for documentation, source code, and to file issues.\nThis program is licensed GPLv3; it comes with ABSOLUTELY NO WARRANTY.\nThis is free software, and you are welcome to redistribute it under certain conditions.\nReview license details at https://github.com/emmaly/musicstate/LICENSE\n\n\nUse http://%s as your browser source overlay URL.\n\n\n", hostAddr)
+	fmt.Printf("SorceressEmmaly's MusicState\nCopyright (C) 2025 emmaly\nSee https://github.com/emmaly/musicstate for documentation, source code, and to file issues.\nThis program is licensed under GPLv3; it comes with ABSOLUTELY NO WARRANTY.\nThis is free software, and you are welcome to redistribute it under certain conditions.\n\nListening on http://%s\n", hostAddr)
 
 	// Create a server with our mux
 	server := &http.Server{
@@ -242,14 +337,15 @@ func main() {
 	}()
 
 	// Start the server
+	log.Printf("Starting server on %s", hostAddr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal("error starting service: ", err)
+		log.Fatal("Error starting server: ", err)
 	}
 
 	// Wait for server to complete shutdown
 	<-serverStopCtx.Done()
 	log.Println("Server shutdown complete")
-	
+
 	// Close the file logger if it was opened
 	if fileLogger != nil {
 		if err := fileLogger.Close(); err != nil {
@@ -259,20 +355,11 @@ func main() {
 }
 
 func wsHandler() http.HandlerFunc {
-	// Create a context with cancellation for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	server := Server{
-		ctx:    ctx,
-		cancel: cancel,
-	}
+	// Use the global server instance to share state across the application
+	// This ensures Web Scrobbler data is properly sent to websocket clients
+	server := globalServer
 
-	// Set up clean shutdown on application exit
-	setupCleanShutdown(&server)
-
-	// Start watching for music changes with context
-	go server.watchMusic()
-
-	// Start a connection health checker with context
+	// Start a connection health checker for this handler
 	go server.connectionHealthCheck()
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -339,8 +426,7 @@ func wsHandler() http.HandlerFunc {
 			return
 		}
 
-		// Keep connection alive and handle any incoming messages
-		// Create a goroutine to handle context cancellation
+		// Keep connection alive and handle incoming messages
 		connCtx, connCancel := context.WithCancel(server.ctx)
 		defer connCancel()
 
@@ -417,49 +503,41 @@ func (server *Server) reportMusic(song *Song) {
 		// Context cancelled, don't report music
 		return
 	default:
-		// Context still valid, continue
+		// Continue normal execution
 	}
 
-	// First check if there's any change with a read lock
+	// Lock for reading
 	server.mu.RLock()
-	noChange := (server.song == nil && song == nil) ||
-		(server.song != nil &&
-			song != nil &&
-			server.song.Song == song.Song &&
-			server.song.Artist == song.Artist &&
-			server.song.AlbumArt == song.AlbumArt)
-	hasConnections := server.connections != nil && len(server.connections) > 0
+
+	// Check if there are any connections first
+	hasConnections := len(server.connections) > 0
+
+	// Check if there's an actual change to report
+	noChange := song != nil && server.song != nil &&
+		server.song.Song == song.Song &&
+		server.song.Artist == song.Artist &&
+		server.song.AlbumArt == song.AlbumArt
+
 	server.mu.RUnlock()
 
-	// If no changes or no connections, return early without acquiring write lock
-	if noChange || !hasConnections {
+	// If no connections, return early but still update the server state
+	if !hasConnections {
+		// Just update the server state if needed
+		if !noChange {
+			server.mu.Lock()
+			server.song = song
+			server.mu.Unlock()
+		}
 		return
 	}
 
 	// Upgrade to write lock to modify server state
 	server.mu.Lock()
 
-	// Double-check state with the write lock (state might have changed)
-	if (server.song == nil && song == nil) ||
-		(server.song != nil &&
-			song != nil &&
-			server.song.Song == song.Song &&
-			server.song.Artist == song.Artist &&
-			server.song.AlbumArt == song.AlbumArt) {
-		server.mu.Unlock()
-		return // nothing to do
-	}
-
 	// Update the stored song
 	server.song = song
 
-	// Check if we have any connections
-	if server.connections == nil || len(server.connections) == 0 {
-		server.mu.Unlock()
-		return
-	}
-
-	// Create the appropriate update based on whether there's a song or not
+	// Create the appropriate update
 	var update SongUpdate
 	if song == nil {
 		update = SongUpdate{Type: "stop"}
@@ -479,7 +557,7 @@ func (server *Server) reportMusic(song *Song) {
 	case <-server.ctx.Done():
 		return
 	default:
-		// Context still valid, continue
+		// Continue normal execution
 	}
 
 	// Track dead connections to clean up after sending messages
@@ -526,7 +604,7 @@ func (server *Server) reportMusic(song *Song) {
 	case <-server.ctx.Done():
 		return
 	default:
-		// Context still valid, continue
+		// Continue normal execution
 	}
 
 	// Clean up any connections that failed during this update
@@ -555,7 +633,7 @@ func (server *Server) connectionHealthCheck() {
 	log.Println("Starting WebSocket connection health checker")
 
 	// Create a ticker for regular health checks
-	ticker := time.NewTicker(healthCheckInterval)
+	ticker := time.NewTimer(healthCheckInterval)
 	defer ticker.Stop()
 
 	for {
@@ -566,19 +644,21 @@ func (server *Server) connectionHealthCheck() {
 			return
 
 		case <-ticker.C:
+			// Reset the timer for the next check
+			ticker.Reset(healthCheckInterval)
+
 			// First check for connections with a read lock
 			server.mu.RLock()
-			hasConnections := server.connections != nil && len(server.connections) > 0
+			hasConnections := len(server.connections) > 0
 			server.mu.RUnlock()
 
 			if !hasConnections {
 				continue
 			}
 
-			// Perform a health check with write lock to get copy of connections
+			// Perform a health check with write lock
 			server.mu.Lock()
-			// Double check connections exist with write lock
-			if server.connections == nil || len(server.connections) == 0 {
+			if len(server.connections) == 0 {
 				server.mu.Unlock()
 				continue
 			}
@@ -622,10 +702,10 @@ func (server *Server) connectionHealthCheck() {
 					case <-server.ctx.Done():
 						return
 					default:
-						// Context still valid, continue with ping
+						// Continue with ping
 					}
 
-					// Ping the connection to keep it alive and verify it's still working
+					// Ping the connection to keep it alive
 					deadline := time.Now().Add(5 * time.Second)
 					err := connState.Conn.WriteControl(websocket.PingMessage, []byte{}, deadline)
 					if err != nil {
@@ -647,7 +727,7 @@ func (server *Server) connectionHealthCheck() {
 			case <-server.ctx.Done():
 				return
 			default:
-				// Context still valid, continue with cleanup
+				// Continue with cleanup
 			}
 
 			// Clean up dead connections
@@ -671,9 +751,229 @@ func (server *Server) connectionHealthCheck() {
 	}
 }
 
+// checkWebScrobblerTimeout periodically checks for timed out Web Scrobbler data
+func (server *Server) checkWebScrobblerTimeout() {
+	log.Println("Starting Web Scrobbler timeout checker")
+
+	// Create a ticker for regular checking
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-server.ctx.Done():
+			// Context cancelled, exit the goroutine cleanly
+			log.Println("Web Scrobbler timeout checker shutting done")
+			return
+
+		case <-ticker.C:
+			now := time.Now()
+
+			// Check if we have Web Scrobbler data
+			server.mu.RLock()
+			webScrobbler := server.webScrobbler
+			currentSong := server.song
+
+			// Calculate if data has timed out
+			webScrobblerTimedOut := webScrobbler != nil &&
+				now.Unix()-(webScrobbler.Time/1000) > int64(WebScrobblerTimeout.Seconds())
+
+			// Check if the current song is from Web Scrobbler
+			isSameArtistSong := currentSong != nil && webScrobbler != nil &&
+				currentSong.Artist == webScrobbler.Data.Song.Parsed.Artist &&
+				currentSong.Song == webScrobbler.Data.Song.Parsed.Track
+
+			server.mu.RUnlock()
+
+			// If Web Scrobbler data has timed out, clear it
+			if webScrobblerTimedOut {
+				timeSinceUpdate := time.Duration(now.Unix()-(webScrobbler.Time/1000)) * time.Second
+				log.Printf("Web Scrobbler data timed out after %v with no updates", timeSinceUpdate)
+
+				server.mu.Lock()
+				server.webScrobbler = nil
+				server.mu.Unlock()
+
+				// Clear the song if it was from Web Scrobbler
+				if isSameArtistSong {
+					log.Printf("Clearing timed-out Web Scrobbler song: %s - %s",
+						currentSong.Artist, currentSong.Song)
+					server.reportMusic(nil)
+				}
+			}
+		}
+	}
+}
+
+// watchNightbotMusic polls the Nightbot API for current songs
+func (server *Server) watchNightbotMusic() {
+	log.Println("Starting Nightbot music watcher")
+
+	// Add panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("RECOVERED from panic in watchNightbotMusic: %v", r)
+			// Wait a bit and restart
+			time.Sleep(2 * time.Second)
+			go server.watchNightbotMusic()
+		}
+	}()
+
+	// Allow configuring Nightbot poll interval with environment variable
+	nightbotPollSeconds, err := strconv.Atoi(os.Getenv("NIGHTBOT_POLL_INTERVAL"))
+	if err != nil || nightbotPollSeconds < 1 {
+		nightbotPollSeconds = int(DefaultNightbotPoll.Seconds())
+	}
+	nightbotPollInterval := time.Duration(nightbotPollSeconds) * time.Second
+	log.Printf("Nightbot poll interval set to %v", nightbotPollInterval)
+
+	// Create a ticker for regular polling
+	ticker := time.NewTicker(nightbotPollInterval)
+	defer ticker.Stop()
+
+	// Use the server's context for cancellation
+	for {
+		select {
+		case <-server.ctx.Done():
+			// Context cancelled, exit the goroutine cleanly
+			log.Println("Nightbot watcher shutting down gracefully")
+			return
+
+		case <-ticker.C:
+			now := time.Now()
+
+			// Skip if we don't have a Nightbot player configured
+			if nightbotPlayer == nil {
+				continue
+			}
+
+			// Poll Nightbot at the configured interval
+			if now.Sub(server.lastNightbotPoll) >= nightbotPollInterval {
+				log.Printf("Polling Nightbot (last poll was %v ago)", now.Sub(server.lastNightbotPoll))
+				server.lastNightbotPoll = now
+
+				// Make the API call with appropriate timeout
+				_, apiCancel := context.WithTimeout(server.ctx, DefaultTimeout)
+				nowPlaying, err := nightbotPlayer.GetCurrentTrack()
+				apiCancel()
+
+				if err == nil && nowPlaying != nil {
+					// Convert to our Song format
+					song := &Song{
+						Artist:   nowPlaying.Artist,
+						Song:     nowPlaying.Title,
+						AlbumArt: "/images/album.jpg", // Use placeholder album art
+					}
+
+					// Store in server state and report to clients
+					server.mu.Lock()
+					server.nightbotSong = song
+					server.mu.Unlock()
+
+					log.Printf("Updated Nightbot song: %s - %s", song.Artist, song.Song)
+					server.reportMusic(song)
+				} else {
+					// Clear the cached song when there's an error or no song playing
+					server.mu.Lock()
+					hadSong := server.nightbotSong != nil
+					server.nightbotSong = nil
+					server.mu.Unlock()
+
+					if hadSong {
+						log.Println("Clearing previously cached Nightbot song")
+						server.reportMusic(nil)
+					}
+
+					if err != nil {
+						if errors.Is(err, musicstate.ErrNoCurrentSong) {
+							log.Println("No current song playing in Nightbot")
+						} else {
+							log.Printf("Nightbot error: %v", err)
+						}
+					} else {
+						log.Println("No current song data from Nightbot")
+					}
+				}
+			}
+		}
+	}
+}
+
+// processWebScrobblerData processes Web Scrobbler data and updates the music state
+func processWebScrobblerData(server *Server, scrobble *webscrobbler.Scrobble) {
+	if server == nil || scrobble == nil {
+		log.Printf("Invalid server or scrobble data")
+		return
+	}
+
+	log.Printf("Processing Web Scrobbler event: %s", scrobble.EventName)
+
+	// Debug parsed song data
+	log.Printf("Web Scrobbler song data: Artist=%s, Track=%s, IsPlaying=%v",
+		scrobble.Data.Song.Parsed.Artist,
+		scrobble.Data.Song.Parsed.Track,
+		scrobble.Data.Song.Parsed.IsPlaying)
+
+	// Create a song object regardless of state
+	song := &Song{
+		Artist:   scrobble.Data.Song.Parsed.Artist,
+		Song:     scrobble.Data.Song.Parsed.Track,
+		AlbumArt: scrobble.Data.Song.Parsed.TrackArt,
+	}
+
+	// If no album art, use the placeholder
+	if song.AlbumArt == "" {
+		song.AlbumArt = "/images/album.jpg"
+	}
+
+	// Lock for updating
+	server.mu.Lock()
+
+	// Store the full scrobble data
+	server.webScrobbler = scrobble
+
+	// Check if it's a playing event
+	shouldShowSong := false
+
+	// We'll consider ANY of these conditions as meaning "show the song"
+	if scrobble.EventName == "nowplaying" ||
+		scrobble.EventName == "resumedplaying" ||
+		scrobble.EventName == "songchange" ||
+		scrobble.Data.Song.Parsed.IsPlaying {
+
+		shouldShowSong = true
+		log.Printf("Considering this a 'playing' event (Will show song)")
+	}
+
+	// If we should show a song, update the state and notify clients
+	if shouldShowSong {
+		// Set the song directly in server state
+		server.song = song
+		log.Printf("Setting song state to %s - %s", song.Artist, song.Song)
+
+		// Unlock before reporting to avoid deadlock
+		server.mu.Unlock()
+
+		// Always update all clients with the new song info
+		// log.Printf("Sending song update to all websocket clients")
+		server.reportMusic(song)
+	} else {
+		// Not a playing event, so clear the song
+		// log.Printf("Not a playing event, clearing song display")
+		server.song = nil
+
+		// Unlock before reporting
+		server.mu.Unlock()
+
+		// Always notify clients to stop showing the song
+		// log.Printf("Sending 'stop' to all clients")
+		server.reportMusic(nil)
+	}
+}
+
 // findConnection looks up a connection by its conn pointer
 func (server *Server) findConnection(conn *websocket.Conn) *ConnectionState {
-	server.mu.RLock() // Use Read Lock for better concurrency
+	server.mu.RLock()
 	defer server.mu.RUnlock()
 
 	for _, connState := range server.connections {
@@ -684,6 +984,7 @@ func (server *Server) findConnection(conn *websocket.Conn) *ConnectionState {
 	return nil
 }
 
+// addConnection adds a connection to the server's connection pool
 func (server *Server) addConnection(connState *ConnectionState) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
@@ -696,30 +997,25 @@ func (server *Server) addConnection(connState *ConnectionState) {
 	log.Printf("Added new connection, total connections: %d", len(server.connections))
 }
 
+// removeConnection removes a connection from the server's connection pool
 func (server *Server) removeConnection(connState *ConnectionState) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 
-	// Safety check for nil or empty connections slice
-	if server.connections == nil || len(server.connections) == 0 {
+	// Safety check for nil connections slice
+	if len(server.connections) == 0 {
 		return
 	}
 
-	// If we're removing the only connection, just set to empty slice
+	// If we're removing the only connection, just reset the slice
 	if len(server.connections) == 1 && server.connections[0] == connState {
-		log.Println("Removed last connection, connections now empty")
+		log.Println("Removed last connection, clearing connection list")
 		server.connections = make([]*ConnectionState, 0)
 		return
 	}
 
-	// Make a copy of the slice to avoid memory leaks
-	// Use max(0, len-1) to ensure capacity is never negative
-	capacity := len(server.connections)
-	if capacity > 0 {
-		capacity--
-	}
-
-	newConnections := make([]*ConnectionState, 0, capacity)
+	// Create a new slice without the connection to remove
+	newConnections := make([]*ConnectionState, 0, len(server.connections)-1)
 
 	// Only append connections that don't match the one we're removing
 	var removed bool
@@ -735,194 +1031,27 @@ func (server *Server) removeConnection(connState *ConnectionState) {
 	if removed {
 		log.Printf("Removed connection, remaining connections: %d", len(newConnections))
 	} else {
-		log.Println("Connection not found in list, no connection removed")
+		log.Printf("Connection not found in list, no connection removed")
 	}
 
 	server.connections = newConnections
 }
 
-// setupCleanShutdown sets up signal handling for graceful shutdown
-func setupCleanShutdown(server *Server) {
-	// Create a channel to listen for OS signals
-	sigChan := make(chan os.Signal, 1)
-
-	// Register for signal notifications
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	// Start a goroutine to handle shutdown signals
-	go func() {
-		// Wait for termination signal
-		sig := <-sigChan
-		log.Printf("Received shutdown signal: %v", sig)
-
-		// Initiate graceful shutdown
-		log.Println("Starting graceful shutdown...")
-
-		// Cancel the context to notify all goroutines
-		if server.cancel != nil {
-			server.cancel()
-		}
-
-		// Close all WebSocket connections
-		server.mu.Lock()
-		connections := server.connections
-		server.connections = nil
-		server.mu.Unlock()
-
-		// Close all active connections
-		for _, connState := range connections {
-			if connState != nil {
-				connState.IsActive = false
-				connState.CloseOnce.Do(func() {
-					if connState.Conn != nil {
-						log.Println("Closing WebSocket connection during shutdown")
-						connState.Conn.Close()
-					}
-				})
-			}
-		}
-
-		log.Println("Graceful shutdown completed")
-	}()
-}
-
-// FindSpotifyTitle finds Spotify window title
-func FindSpotifyTitle() (string, error) {
-	// Find Spotify windows directly
-	spotifyWindows, err := winapi.FindWindowsByProcess(
-		[]string{"Spotify.exe"},
-		winapi.WinVisible(true),
-	)
-
-	if err != nil {
-		return "", err
+// debugLog prints debug messages only if DEBUG environment variable is set
+func debugLog(msg string, args ...interface{}) {
+	if os.Getenv("DEBUG") == "" {
+		return
 	}
 
-	// Get the window title
-	if len(spotifyWindows) > 0 {
-		for _, w := range spotifyWindows {
-			if strings.TrimSpace(w.Title) != "" {
-				return w.Title, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("no Spotify window with title found")
-}
-
-// FindTidalTitle finds TIDAL window title
-func FindTidalTitle() (string, error) {
-	// Find TIDAL windows directly
-	tidalWindows, err := winapi.FindWindowsByProcess(
-		[]string{"TIDAL.exe"},
-		winapi.WinVisible(true),
-	)
-
-	if err != nil {
-		return "", err
-	}
-
-	// Get the window title
-	if len(tidalWindows) > 0 {
-		for _, w := range tidalWindows {
-			if strings.TrimSpace(w.Title) != "" {
-				return w.Title, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("no TIDAL window with title found")
-}
-
-
-// ParseSpotifyTitle parses a Spotify window title
-func ParseSpotifyTitle(title string) *Song {
-	if title == "" {
-		return nil
-	}
-
-	// Check if it's just the application name
-	if title == "Spotify" || title == "Spotify Premium" {
-		return nil
-	}
-
-	// Split by " - " if possible
-	parts := strings.Split(title, " - ")
-
-	if len(parts) >= 2 {
-		return &Song{
-			Artist: parts[0],
-			Song:   strings.Join(parts[1:], " - "),
-		}
-	}
-
-	// If no delimiter, just use the title as song name
-	return &Song{
-		Artist: "Unknown Artist",
-		Song:   title,
+	if len(args) > 0 {
+		log.Printf(msg, args...)
+	} else {
+		log.Println(msg)
 	}
 }
 
-// ParseTidalTitle parses a TIDAL window title
-func ParseTidalTitle(title string) *Song {
-	if title == "" {
-		return nil
-	}
-
-	// Check if it's just the application name
-	if title == "TIDAL" {
-		return nil
-	}
-
-	// Split by " - " if possible
-	parts := strings.Split(title, " - ")
-
-	if len(parts) >= 2 {
-		return &Song{
-			Artist: parts[len(parts)-1],
-			Song:   strings.Join(parts[:len(parts)-1], " - "),
-		}
-	}
-
-	// If no delimiter, just use the title as song name
-	return &Song{
-		Artist: "Unknown Artist",
-		Song:   title,
-	}
-}
-
-
-func (server *Server) watchMusic() {
-	log.Println("Starting watchMusic function...")
-
-	// Add panic recovery
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("RECOVERED from panic in watchMusic: %v", r)
-			// Wait a bit and restart
-			time.Sleep(2 * time.Second)
-			go server.watchMusic()
-		}
-	}()
-
-	const (
-		defaultNightbotPoll = 5               // seconds
-		windowPollInterval  = 2 * time.Second // Increased to reduce CPU usage
-	)
-
-	// Allow configuring Nightbot poll interval with environment variable
-	nightbotPollSeconds, err := strconv.Atoi(os.Getenv("NIGHTBOT_POLL_INTERVAL"))
-	if err != nil || nightbotPollSeconds < 1 {
-		nightbotPollSeconds = defaultNightbotPoll
-	}
-	nightbotPollInterval := time.Duration(nightbotPollSeconds) * time.Second
-	debugLog("Nightbot poll interval set to %v", nightbotPollInterval)
-
-	// Create a Nightbot player if environment variables are set
-	var nightbotPlayer *nightbot.NightbotPlayer
-	var lastNightbotPoll time.Time
-	var lastNightbotSong *Song
-
+// initNightbot initializes Nightbot API client if environment variables are set
+func initNightbot() {
 	clientID := os.Getenv("NIGHTBOT_CLIENT_ID")
 	clientSecret := os.Getenv("NIGHTBOT_CLIENT_SECRET")
 	redirectURL := os.Getenv("NIGHTBOT_REDIRECT_URL")
@@ -931,6 +1060,7 @@ func (server *Server) watchMusic() {
 	// If all Nightbot environment variables are set, initialize the player
 	if clientID != "" && clientSecret != "" && redirectURL != "" && tokenJSON != "" {
 		log.Println("Nightbot configuration found")
+
 		// Parse the token from JSON
 		var token oauth2.Token
 		if err := json.Unmarshal([]byte(tokenJSON), &token); err != nil {
@@ -942,6 +1072,7 @@ func (server *Server) watchMusic() {
 			log.Println("Nightbot player initialized successfully")
 		}
 	} else {
+		// Log which variables are missing
 		if clientID == "" {
 			log.Println("Nightbot disabled: missing NIGHTBOT_CLIENT_ID")
 		}
@@ -954,140 +1085,5 @@ func (server *Server) watchMusic() {
 		if tokenJSON == "" {
 			log.Println("Nightbot disabled: missing NIGHTBOT_TOKEN")
 		}
-	}
-
-	// Create a ticker for regular polling
-	windowTicker := time.NewTicker(windowPollInterval)
-	defer windowTicker.Stop()
-
-	log.Println("Starting music watch loop...")
-	tickCount := 0
-
-	// Use the server's context for cancellation
-	for {
-		tickCount++
-
-		select {
-		case <-server.ctx.Done():
-			// Context cancelled, exit the goroutine cleanly
-			log.Println("Watch music goroutine shutting down gracefully")
-			return
-
-		case <-windowTicker.C:
-			debugLog("Processing tick #%d", tickCount)
-
-			// Regular polling tick
-			var song *Song
-			now := time.Now()
-
-			// First try API-based players (like Nightbot) but only every 5 seconds
-			if nightbotPlayer != nil && now.Sub(lastNightbotPoll) >= nightbotPollInterval {
-				debugLog("Polling Nightbot (last poll was %v ago)", now.Sub(lastNightbotPoll))
-				lastNightbotPoll = now
-
-				// Make the API call with appropriate timeout
-				_, apiCancel := context.WithTimeout(server.ctx, DefaultTimeout)
-				nowPlaying, err := nightbotPlayer.GetCurrentTrack()
-				apiCancel()
-
-				if err == nil && nowPlaying != nil {
-					lastNightbotSong = &Song{
-						Artist: nowPlaying.Artist,
-						Song:   nowPlaying.Title,
-					}
-					debugLog("Updated Nightbot song from API")
-				} else {
-					// Clear the cached song when there's an error or no song playing
-					if lastNightbotSong != nil {
-						debugLog("Clearing previously cached Nightbot song")
-					}
-					lastNightbotSong = nil
-
-					if err != nil {
-						if errors.Is(err, nightbot.ErrNoCurrentSong) {
-							debugLog("No current song playing in Nightbot")
-						} else {
-							debugLog("Nightbot error: %v", err)
-						}
-					} else {
-						debugLog("No current song data from Nightbot")
-					}
-				}
-			}
-
-			// Use the cached Nightbot song if available
-			if lastNightbotSong != nil {
-				song = lastNightbotSong
-			}
-
-			// Always check for window-based players to detect when songs stop
-			var foundWindowSong bool
-
-			// Try to find Spotify
-			debugLog("Checking Spotify...")
-			spotifyTitle, spotifyErr := FindSpotifyTitle()
-			if spotifyErr == nil && spotifyTitle != "" {
-				debugLog("Found Spotify title: %s", spotifyTitle)
-				if spotifySong := ParseSpotifyTitle(spotifyTitle); spotifySong != nil {
-					foundWindowSong = true
-					if song == nil {
-						song = spotifySong
-						debugLog("Using Spotify song: %s - %s", song.Artist, song.Song)
-					}
-				}
-			}
-
-			// Try to find TIDAL if no song yet
-			if !foundWindowSong {
-				debugLog("Checking TIDAL...")
-				tidalTitle, tidalErr := FindTidalTitle()
-				if tidalErr == nil && tidalTitle != "" {
-					debugLog("Found TIDAL title: %s", tidalTitle)
-					if tidalSong := ParseTidalTitle(tidalTitle); tidalSong != nil {
-						foundWindowSong = true
-						if song == nil {
-							song = tidalSong
-							debugLog("Using TIDAL song: %s - %s", song.Artist, song.Song)
-						}
-					}
-				}
-			}
-
-
-			// If no window song found and last Nightbot poll was a while ago,
-			// clear the lastNightbotSong to ensure we don't keep stale state
-			if !foundWindowSong && lastNightbotSong != nil && now.Sub(lastNightbotPoll) >= (nightbotPollInterval*2) {
-				debugLog("No window song found and Nightbot poll is old - clearing song cache")
-				lastNightbotSong = nil
-				song = nil
-			}
-
-			if song != nil && song.Song != "" && song.AlbumArt == "" {
-				// set the placeholder album art
-				// Use a relative URL for the album art so it works with any host/port
-				song.AlbumArt = "/images/album.jpg"
-			}
-
-			// Log the final decision
-			if song != nil {
-				debugLog("Reporting song: %s - %s", song.Artist, song.Song)
-			} else {
-				debugLog("No song found to report")
-			}
-
-			server.reportMusic(song)
-		}
-	}
-}
-
-func debugLog(msg string, args ...interface{}) {
-	if os.Getenv("DEBUG") == "" {
-		return
-	}
-
-	if len(args) > 0 {
-		log.Printf(msg, args...)
-	} else {
-		log.Println(msg)
 	}
 }
