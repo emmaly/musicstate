@@ -136,6 +136,7 @@ func main() {
 
 	// Create a channel for shutdown completion notification
 	serverStopCtx, serverStopCtxCancel := context.WithCancel(context.Background())
+	defer serverStopCtxCancel() // Ensure cancellation to prevent context leak
 
 	// Handle graceful server shutdown
 	go func() {
@@ -790,8 +791,25 @@ func (server *Server) watchMusic() {
 				// Set a deadline for the API call
 				apiCallStart := time.Now()
 
-				// Make the API call
+				// Create a context with timeout for the API call
+				apiCtx, apiCancel := context.WithTimeout(server.ctx, DefaultTimeout)
+				defer apiCancel() // Always ensure context is cancelled
+
+				// Make the API call with appropriate timeout
+				// We don't directly pass the context to GetCurrentTrack since it has its own timeout,
+				// but we check for cancellation immediately after
 				nowPlaying, err := nightbotPlayer.GetCurrentTrack()
+
+				// Check if our context was cancelled during the API call
+				select {
+				case <-apiCtx.Done():
+					if err == nil {
+						err = apiCtx.Err()
+						log.Printf("API context cancelled: %v", err)
+					}
+				default:
+					// Context still valid
+				}
 
 				// Log warning if the call took too long
 				if time.Since(apiCallStart) > DefaultTimeout {
