@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -704,12 +703,208 @@ func setupCleanShutdown(server *Server) {
 	}()
 }
 
+// FindSpotifyTitle finds Spotify window title
+func FindSpotifyTitle() (string, error) {
+	// Find Spotify windows directly
+	spotifyWindows, err := winapi.FindWindowsByProcess(
+		[]string{"Spotify.exe"},
+		winapi.WinVisible(true),
+	)
+
+	if err != nil {
+		return "", err
+	}
+
+	// Get the window title
+	if len(spotifyWindows) > 0 {
+		for _, w := range spotifyWindows {
+			if strings.TrimSpace(w.Title) != "" {
+				return w.Title, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no Spotify window with title found")
+}
+
+// FindTidalTitle finds TIDAL window title
+func FindTidalTitle() (string, error) {
+	// Find TIDAL windows directly
+	tidalWindows, err := winapi.FindWindowsByProcess(
+		[]string{"TIDAL.exe"},
+		winapi.WinVisible(true),
+	)
+
+	if err != nil {
+		return "", err
+	}
+
+	// Get the window title
+	if len(tidalWindows) > 0 {
+		for _, w := range tidalWindows {
+			if strings.TrimSpace(w.Title) != "" {
+				return w.Title, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no TIDAL window with title found")
+}
+
+// FindAppleMusicTitle finds Apple Music window title
+func FindAppleMusicTitle() (string, error) {
+	// Known browser processes
+	browserProcesses := []string{
+		"chrome.exe",
+		"msedge.exe",
+		"firefox.exe",
+		"opera.exe",
+		"brave.exe",
+	}
+
+	// Find browser windows with Apple Music
+	for _, browser := range browserProcesses {
+		windows, err := winapi.FindWindowsByProcess(
+			[]string{browser},
+			winapi.WinVisible(true),
+		)
+
+		if err == nil && len(windows) > 0 {
+			// Check for Apple Music in title
+			for _, w := range windows {
+				if strings.Contains(w.Title, "Apple Music") {
+					return w.Title, nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no browser window with Apple Music found")
+}
+
+// ParseSpotifyTitle parses a Spotify window title
+func ParseSpotifyTitle(title string) *Song {
+	if title == "" {
+		return nil
+	}
+
+	// Check if it's just the application name
+	if title == "Spotify" || title == "Spotify Premium" {
+		return nil
+	}
+
+	// Split by " - " if possible
+	parts := strings.Split(title, " - ")
+
+	if len(parts) >= 2 {
+		return &Song{
+			Artist: parts[0],
+			Song:   strings.Join(parts[1:], " - "),
+		}
+	}
+
+	// If no delimiter, just use the title as song name
+	return &Song{
+		Artist: "Unknown Artist",
+		Song:   title,
+	}
+}
+
+// ParseTidalTitle parses a TIDAL window title
+func ParseTidalTitle(title string) *Song {
+	if title == "" {
+		return nil
+	}
+
+	// Check if it's just the application name
+	if title == "TIDAL" {
+		return nil
+	}
+
+	// Split by " - " if possible
+	parts := strings.Split(title, " - ")
+
+	if len(parts) >= 2 {
+		return &Song{
+			Artist: parts[len(parts)-1],
+			Song:   strings.Join(parts[:len(parts)-1], " - "),
+		}
+	}
+
+	// If no delimiter, just use the title as song name
+	return &Song{
+		Artist: "Unknown Artist",
+		Song:   title,
+	}
+}
+
+// ParseAppleMusicTitle parses an Apple Music window title
+func ParseAppleMusicTitle(title string) *Song {
+	if title == "" || !strings.Contains(title, "Apple Music") {
+		return nil
+	}
+
+	// Remove browser suffix
+	appleIndex := strings.Index(title, "Apple Music")
+	if appleIndex > 0 {
+		title = title[:appleIndex+11]
+	}
+
+	// Remove " - Apple Music" suffix
+	title = strings.TrimSuffix(title, " - Apple Music")
+	title = strings.TrimSpace(title)
+
+	// Try to find artist with " by " separator
+	byParts := strings.Split(title, " by ")
+	if len(byParts) >= 2 {
+		artist := strings.TrimSpace(byParts[len(byParts)-1])
+
+		// Handle the song title part
+		songTitle := strings.Join(byParts[:len(byParts)-1], " by ")
+
+		// Clean up song title
+		// Remove " - Album" or " - Single" if present
+		for _, suffix := range []string{" - Album", " - Single", " - EP"} {
+			if idx := strings.LastIndex(songTitle, suffix); idx >= 0 {
+				songTitle = songTitle[:idx]
+				break
+			}
+		}
+
+		// Clean up any invisible characters
+		if len(songTitle) > 0 && songTitle[0] < 32 {
+			songTitle = songTitle[1:]
+		}
+
+		return &Song{
+			Artist: artist,
+			Song:   strings.TrimSpace(songTitle),
+		}
+	}
+
+	// Fallback if no " by " found
+	return &Song{
+		Artist: "Unknown Artist",
+		Song:   title,
+	}
+}
+
 func (server *Server) watchMusic() {
+	log.Println("Starting watchMusic function...")
+
+	// Add panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("RECOVERED from panic in watchMusic: %v", r)
+			// Wait a bit and restart
+			time.Sleep(2 * time.Second)
+			go server.watchMusic()
+		}
+	}()
+
 	const (
-		tidal               = "TIDAL.exe"
-		spotify             = "Spotify.exe"
-		defaultNightbotPoll = 5 // seconds
-		windowPollInterval  = 1 * time.Second
+		defaultNightbotPoll = 5               // seconds
+		windowPollInterval  = 2 * time.Second // Increased to reduce CPU usage
 	)
 
 	// Allow configuring Nightbot poll interval with environment variable
@@ -718,7 +913,7 @@ func (server *Server) watchMusic() {
 		nightbotPollSeconds = defaultNightbotPoll
 	}
 	nightbotPollInterval := time.Duration(nightbotPollSeconds) * time.Second
-	log.Printf("Nightbot poll interval set to %v", nightbotPollInterval)
+	debugLog("Nightbot poll interval set to %v", nightbotPollInterval)
 
 	// Create a Nightbot player if environment variables are set
 	var nightbotPlayer *nightbot.NightbotPlayer
@@ -745,16 +940,16 @@ func (server *Server) watchMusic() {
 		}
 	} else {
 		if clientID == "" {
-			log.Println("Missing NIGHTBOT_CLIENT_ID")
+			log.Println("Nightbot disabled: missing NIGHTBOT_CLIENT_ID")
 		}
 		if clientSecret == "" {
-			log.Println("Missing NIGHTBOT_CLIENT_SECRET")
+			log.Println("Nightbot disabled: missing NIGHTBOT_CLIENT_SECRET")
 		}
 		if redirectURL == "" {
-			log.Println("Missing NIGHTBOT_REDIRECT_URL")
+			log.Println("Nightbot disabled: missing NIGHTBOT_REDIRECT_URL")
 		}
 		if tokenJSON == "" {
-			log.Println("Missing NIGHTBOT_TOKEN")
+			log.Println("Nightbot disabled: missing NIGHTBOT_TOKEN")
 		}
 	}
 
@@ -762,8 +957,13 @@ func (server *Server) watchMusic() {
 	windowTicker := time.NewTicker(windowPollInterval)
 	defer windowTicker.Stop()
 
+	log.Println("Starting music watch loop...")
+	tickCount := 0
+
 	// Use the server's context for cancellation
 	for {
+		tickCount++
+
 		select {
 		case <-server.ctx.Done():
 			// Context cancelled, exit the goroutine cleanly
@@ -771,73 +971,43 @@ func (server *Server) watchMusic() {
 			return
 
 		case <-windowTicker.C:
+			debugLog("Processing tick #%d", tickCount)
+
 			// Regular polling tick
 			var song *Song
 			now := time.Now()
 
 			// First try API-based players (like Nightbot) but only every 5 seconds
 			if nightbotPlayer != nil && now.Sub(lastNightbotPoll) >= nightbotPollInterval {
-				log.Printf("Polling Nightbot (last poll was %v ago)", now.Sub(lastNightbotPoll))
+				debugLog("Polling Nightbot (last poll was %v ago)", now.Sub(lastNightbotPoll))
 				lastNightbotPoll = now
 
-				// Check if parent context is already cancelled
-				select {
-				case <-server.ctx.Done():
-					return
-				default:
-					// Context still valid, proceed with API call
-				}
-
-				// Set a deadline for the API call
-				apiCallStart := time.Now()
-
-				// Create a context with timeout for the API call
-				apiCtx, apiCancel := context.WithTimeout(server.ctx, DefaultTimeout)
-				defer apiCancel() // Always ensure context is cancelled
-
 				// Make the API call with appropriate timeout
-				// We don't directly pass the context to GetCurrentTrack since it has its own timeout,
-				// but we check for cancellation immediately after
+				_, apiCancel := context.WithTimeout(server.ctx, DefaultTimeout)
 				nowPlaying, err := nightbotPlayer.GetCurrentTrack()
-
-				// Check if our context was cancelled during the API call
-				select {
-				case <-apiCtx.Done():
-					if err == nil {
-						err = apiCtx.Err()
-						log.Printf("API context cancelled: %v", err)
-					}
-				default:
-					// Context still valid
-				}
-
-				// Log warning if the call took too long
-				if time.Since(apiCallStart) > DefaultTimeout {
-					log.Printf("Warning: Nightbot API call took %v, longer than expected timeout of %v",
-						time.Since(apiCallStart), DefaultTimeout)
-				}
+				apiCancel()
 
 				if err == nil && nowPlaying != nil {
 					lastNightbotSong = &Song{
 						Artist: nowPlaying.Artist,
 						Song:   nowPlaying.Title,
 					}
-					log.Println("Updated Nightbot song from API")
+					debugLog("Updated Nightbot song from API")
 				} else {
 					// Clear the cached song when there's an error or no song playing
 					if lastNightbotSong != nil {
-						log.Println("Clearing previously cached Nightbot song")
+						debugLog("Clearing previously cached Nightbot song")
 					}
 					lastNightbotSong = nil
 
 					if err != nil {
 						if errors.Is(err, nightbot.ErrNoCurrentSong) {
-							log.Println("No current song playing in Nightbot")
+							debugLog("No current song playing in Nightbot")
 						} else {
-							log.Printf("Nightbot error: %v", err)
+							debugLog("Nightbot error: %v", err)
 						}
 					} else {
-						log.Println("No current song data from Nightbot")
+						debugLog("No current song data from Nightbot")
 					}
 				}
 			}
@@ -848,56 +1018,60 @@ func (server *Server) watchMusic() {
 			}
 
 			// Always check for window-based players to detect when songs stop
-			// Check context before performing window search
-			select {
-			case <-server.ctx.Done():
-				return
-			default:
-				// Context still valid, continue with window search
+			var foundWindowSong bool
+
+			// Try to find Spotify
+			debugLog("Checking Spotify...")
+			spotifyTitle, spotifyErr := FindSpotifyTitle()
+			if spotifyErr == nil && spotifyTitle != "" {
+				debugLog("Found Spotify title: %s", spotifyTitle)
+				if spotifySong := ParseSpotifyTitle(spotifyTitle); spotifySong != nil {
+					foundWindowSong = true
+					if song == nil {
+						song = spotifySong
+						debugLog("Using Spotify song: %s - %s", song.Artist, song.Song)
+					}
+				}
 			}
 
-			windows, err := winapi.FindWindowsByProcess(
-				[]string{tidal, spotify},
-				winapi.WinVisible(true),
-				winapi.WinClass("Chrome_WidgetWin_1"),
-				winapi.WinTitlePattern(*regexp.MustCompile("-")),
-			)
-
-			var foundWindowSong bool
-			if err != nil {
-				log.Printf("Error finding windows: %v", err)
-			} else {
-				for _, w := range windows {
-					delimiter := " - "
-					songParts := strings.Split(w.Title, delimiter)
-					if len(songParts) >= 2 {
+			// Try to find TIDAL if no song yet
+			if !foundWindowSong {
+				debugLog("Checking TIDAL...")
+				tidalTitle, tidalErr := FindTidalTitle()
+				if tidalErr == nil && tidalTitle != "" {
+					debugLog("Found TIDAL title: %s", tidalTitle)
+					if tidalSong := ParseTidalTitle(tidalTitle); tidalSong != nil {
 						foundWindowSong = true
-						if song == nil { // Only use window song if we don't have a Nightbot song
-							if w.ProcessName == tidal {
-								song = &Song{
-									Artist: songParts[len(songParts)-1],
-									Song:   strings.Join(songParts[:len(songParts)-1], delimiter),
-								}
-							} else if w.ProcessName == spotify {
-								song = &Song{
-									Artist: songParts[0],
-									Song:   strings.Join(songParts[1:], delimiter),
-								}
-							}
+						if song == nil {
+							song = tidalSong
+							debugLog("Using TIDAL song: %s - %s", song.Artist, song.Song)
 						}
 					}
-					if song != nil && foundWindowSong {
-						break
+				}
+			}
+
+			// Try to find Apple Music if no song yet
+			if !foundWindowSong {
+				debugLog("Checking Apple Music...")
+				appleMusicTitle, appleErr := FindAppleMusicTitle()
+				if appleErr == nil && appleMusicTitle != "" {
+					debugLog("Found Apple Music title: %s", appleMusicTitle)
+					if appleSong := ParseAppleMusicTitle(appleMusicTitle); appleSong != nil {
+						foundWindowSong = true
+						if song == nil {
+							song = appleSong
+							debugLog("Using Apple Music song: %s - %s", song.Artist, song.Song)
+						}
 					}
 				}
+			}
 
-				// If no window song found and last Nightbot poll was a while ago,
-				// clear the lastNightbotSong to ensure we don't keep stale state
-				if !foundWindowSong && lastNightbotSong != nil && now.Sub(lastNightbotPoll) >= (nightbotPollInterval*2) {
-					log.Println("No window song found and Nightbot poll is old - clearing song cache")
-					lastNightbotSong = nil
-					song = nil
-				}
+			// If no window song found and last Nightbot poll was a while ago,
+			// clear the lastNightbotSong to ensure we don't keep stale state
+			if !foundWindowSong && lastNightbotSong != nil && now.Sub(lastNightbotPoll) >= (nightbotPollInterval*2) {
+				debugLog("No window song found and Nightbot poll is old - clearing song cache")
+				lastNightbotSong = nil
+				song = nil
 			}
 
 			if song != nil && song.Song != "" && song.AlbumArt == "" {
@@ -906,7 +1080,26 @@ func (server *Server) watchMusic() {
 				song.AlbumArt = "/images/album.jpg"
 			}
 
+			// Log the final decision
+			if song != nil {
+				debugLog("Reporting song: %s - %s", song.Artist, song.Song)
+			} else {
+				debugLog("No song found to report")
+			}
+
 			server.reportMusic(song)
 		}
+	}
+}
+
+func debugLog(msg string, args ...interface{}) {
+	if os.Getenv("DEBUG") == "" {
+		return
+	}
+
+	if len(args) > 0 {
+		log.Printf(msg, args...)
+	} else {
+		log.Println(msg)
 	}
 }

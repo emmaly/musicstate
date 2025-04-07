@@ -108,11 +108,19 @@ func init() {
 }
 
 // FindWindowsByProcess returns all windows belonging to the specified processes that pass the provided filters
+// If processNames is empty, it will return all windows that match the filters
 func FindWindowsByProcess(processNames []string, filters ...Filter) ([]Window, error) {
 	var windows []Window
 	processMap := make(map[string]bool)
-	for _, name := range processNames {
-		processMap[strings.ToLower(name)] = true
+
+	// Empty processNames means match all processes
+	findAll := len(processNames) == 0
+
+	// Otherwise, build a map of process names to check
+	if !findAll {
+		for _, name := range processNames {
+			processMap[strings.ToLower(name)] = true
+		}
 	}
 
 	// Use a static callback to avoid GC issues with callback function pointers
@@ -148,7 +156,7 @@ func FindWindowsByProcess(processNames []string, filters ...Filter) ([]Window, e
 		getWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
 
 		name, err := getProcessExecutableName(pid)
-		if err == nil && processMap[strings.ToLower(name)] {
+		if err == nil && (findAll || processMap[strings.ToLower(name)]) {
 			w := Window{
 				Handle:      hwnd,
 				Title:       getWindowText(hwnd),
